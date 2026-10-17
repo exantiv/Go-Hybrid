@@ -177,6 +177,30 @@ impl<'a> Checker<'a> {
                                 }
                             }
                         }
+                        // A7 / O13: `serde_json.set(v, key, value_handle)` moves
+                        // `value_handle`'s payload into `v`, consuming the handle.
+                        if pkg == "serde_json" && method == "set" {
+                            if let Some(val_arg) = cr.args.get(2) {
+                                if let Some(val_root) = val_arg.value.root_ident() {
+                                    let active_handle = self
+                                        .lookup_binding(st, val_root)
+                                        .map(|b| b.shape.is_handle() && b.moved.is_none())
+                                        .unwrap_or(false);
+                                    if active_handle {
+                                        let rspan =
+                                            root_ident_span(&val_arg.value).unwrap_or(val_arg.span);
+                                        self.mark_move(
+                                            st,
+                                            val_root,
+                                            cr.span,
+                                            format!("the consuming call `{}`", cr.callee.render()),
+                                            MoveKind::Consumed,
+                                        );
+                                        stmt_consumes.push((rspan, cr.span));
+                                    }
+                                }
+                            }
+                        }
                     }
                     CallMode::Consume => {
                         for a in cr.args {
@@ -246,6 +270,37 @@ impl<'a> Checker<'a> {
                     }
                     CallMode::Mutate => {
                         self.check_a2_conflict(st, cr, &root, idx);
+                        // A7 / O13: `v.set(key, value_handle)` moves `value_handle`'s
+                        // payload into `v` (`hy_json_set` frees the value slot and
+                        // zeroes its handle ID). Check A2 conflicts on `value_handle`
+                        // and mark it consumed.
+                        if (tname == "serde_json.value" || tname == "serde_json.view")
+                            && method == "set"
+                        {
+                            if let Some(val_arg) = cr.args.get(1) {
+                                if let Some(val_root) = val_arg.value.root_ident() {
+                                    let active_handle = self
+                                        .lookup_binding(st, val_root)
+                                        .map(|b| b.shape.is_handle() && b.moved.is_none())
+                                        .unwrap_or(false);
+                                    if active_handle {
+                                        if val_root != root {
+                                            self.check_a2_conflict(st, cr, val_root, idx);
+                                        }
+                                        let rspan =
+                                            root_ident_span(&val_arg.value).unwrap_or(val_arg.span);
+                                        self.mark_move(
+                                            st,
+                                            val_root,
+                                            cr.span,
+                                            format!("the consuming call `{}`", cr.callee.render()),
+                                            MoveKind::Consumed,
+                                        );
+                                        stmt_consumes.push((rspan, cr.span));
+                                    }
+                                }
+                            }
+                        }
                     }
                     CallMode::Consume => {
                         // A7: own-transfer INTO the API — receiver moved-from
@@ -1661,7 +1716,7 @@ impl<'a> Checker<'a> {
                     if let Some(hy_syntax::TypeExpr::Fn { params, .. }) = &b.ty {
                         return params
                             .get(idx)
-                            .is_some_and(|p| matches!(p.ty, hy_syntax::TypeExpr::Pointer { .. }));
+                            .is_some_and(|p| matches!(self.shape_of_type(&p.ty), TypeShape::Pointer(_)));
                     }
                     return false;
                 }
@@ -1670,7 +1725,7 @@ impl<'a> Checker<'a> {
                     .get(name.as_str())
                     .or_else(|| self.fns.get(head))
                     .and_then(|f| f.params.get(idx))
-                    .is_some_and(|p| matches!(p.ty, hy_syntax::TypeExpr::Pointer { .. }))
+                    .is_some_and(|p| matches!(self.shape_of_type(&p.ty), TypeShape::Pointer(_)))
             }
             Expr::Field { base, name, .. } => {
                 let head = Self::base_named_type_str(name);
@@ -1681,7 +1736,7 @@ impl<'a> Checker<'a> {
                             return f
                                 .params
                                 .get(idx)
-                                .is_some_and(|p| matches!(p.ty, hy_syntax::TypeExpr::Pointer { .. }));
+                                .is_some_and(|p| matches!(self.shape_of_type(&p.ty), TypeShape::Pointer(_)));
                         }
                     }
                 }
@@ -1704,11 +1759,11 @@ impl<'a> Checker<'a> {
                 recv_base
                     .and_then(|rb| self.method_decls.get(&(rb, head.to_string())))
                     .and_then(|f| f.params.get(idx))
-                    .is_some_and(|p| matches!(p.ty, hy_syntax::TypeExpr::Pointer { .. }))
+                    .is_some_and(|p| matches!(self.shape_of_type(&p.ty), TypeShape::Pointer(_)))
             }
             Expr::FnLit { params, .. } => params
                 .get(idx)
-                .is_some_and(|p| matches!(p.ty, hy_syntax::TypeExpr::Pointer { .. })),
+                .is_some_and(|p| matches!(self.shape_of_type(&p.ty), TypeShape::Pointer(_))),
             _ => false,
         }
     }
@@ -2915,6 +2970,7 @@ impl<'a> Checker<'a> {
                     }
                     let mut addr_roots = Vec::new();
                     self.collect_borrowed_roots(st, value, &mut addr_roots);
+                    let mut first = true;
                     for src in addr_roots {
                         if src != *name {
                             let matched = self.lookup_binding(st, &src).map(|b| {
@@ -2923,7 +2979,11 @@ impl<'a> Checker<'a> {
                                 (ok, b.non_owned_origin.clone())
                             });
                             if let Some((true, origin)) = matched {
-                                st.aliases.insert(name.clone(), src);
+                                if first {
+                                    st.aliases.insert(name.clone(), src.clone());
+                                    first = false;
+                                }
+                                st.share_edge(name, &src);
                                 if let Some(origin) = origin {
                                     if let Some(nb) = st.env_lookup_mut(name) {
                                         if nb.non_owned_origin.is_none() {
@@ -2931,7 +2991,6 @@ impl<'a> Checker<'a> {
                                         }
                                     }
                                 }
-                                break;
                             }
                         }
                     }
@@ -2973,6 +3032,7 @@ impl<'a> Checker<'a> {
                         }
                         let mut addr_roots = Vec::new();
                         self.collect_borrowed_roots(st, v, &mut addr_roots);
+                        let mut first = true;
                         for src in addr_roots {
                             if src != *name {
                                 let matched = self.lookup_binding(st, &src).map(|b| {
@@ -2981,7 +3041,11 @@ impl<'a> Checker<'a> {
                                     (ok, b.non_owned_origin.clone())
                                 });
                                 if let Some((true, origin)) = matched {
-                                    st.aliases.insert(name.clone(), src);
+                                    if first {
+                                        st.aliases.insert(name.clone(), src.clone());
+                                        first = false;
+                                    }
+                                    st.share_edge(name, &src);
                                     if let Some(origin) = origin {
                                         if let Some(nb) = st.env_lookup_mut(name) {
                                             if nb.non_owned_origin.is_none() {
@@ -2989,7 +3053,6 @@ impl<'a> Checker<'a> {
                                             }
                                         }
                                     }
-                                    break;
                                 }
                             }
                         }
@@ -4382,6 +4445,7 @@ impl<'a> Checker<'a> {
             match stmt {
                 Stmt::Local(l) => {
                     self.process_closure_const_local(&mut cst, l);
+                    self.record_local_borrow_aliases(&mut cst, l);
                 }
                 Stmt::Assign {
                     targets,
@@ -4755,7 +4819,8 @@ impl<'a> Checker<'a> {
                     .copied()
                 {
                     if let Some(r) = &decl.receiver {
-                        let ptr_recv = matches!(r.ty, hy_syntax::TypeExpr::Pointer { .. });
+                        let ptr_recv =
+                            r.is_pointer || matches!(r.ty, hy_syntax::TypeExpr::Pointer { .. });
                         let recv_const = if ptr_recv {
                             base.root_ident()
                                 .filter(|root| !declared.contains(*root))
@@ -4781,7 +4846,25 @@ impl<'a> Checker<'a> {
             }
         }
         for (i, a) in cr.args.iter().enumerate() {
-            let Some(const_name) = self.const_arg_root(st, &a.value, declared) else {
+            let const_name = self.const_arg_root(st, &a.value, declared).or_else(|| {
+                if self.call_param_is_pointer(st, callee, i) {
+                    a.value
+                        .root_ident()
+                        .filter(|root| !declared.contains(*root))
+                        .and_then(|root| {
+                            self.const_write_root(
+                                st,
+                                &Place {
+                                    kind: PlaceKind::Ident(root.to_string()),
+                                    span: a.value.span(),
+                                },
+                            )
+                        })
+                } else {
+                    None
+                }
+            });
+            let Some(const_name) = const_name else {
                 continue;
             };
             let mutates = match callee {
