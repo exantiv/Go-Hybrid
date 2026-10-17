@@ -370,12 +370,21 @@ impl FnState {
                 }
             }
         }
+        let mut inner_outer_aliases: Vec<(String, String)> = Vec::new();
+        for (a, target) in &self.aliases {
+            if !popped_scope.contains_key(a) && !popped_scope.contains_key(target) && a != target {
+                inner_outer_aliases.push((a.clone(), target.clone()));
+            }
+        }
         self.scopes.pop();
         if let Some(outer_shadows) = self.shadow_link_scopes.pop() {
             self.shadow_links = outer_shadows;
         }
         if let Some(outer_aliases) = self.alias_scopes.pop() {
             self.aliases = outer_aliases;
+            for (a, target) in inner_outer_aliases {
+                self.aliases.entry(a).or_insert(target);
+            }
             if let Some(outer_share) = self.share_scopes.pop() {
                 self.may_share = outer_share;
                 for (a, b) in inner_outer_shares {
@@ -805,17 +814,6 @@ pub(crate) fn collect_ref_roots(e: &Expr, out: &mut Vec<String>) {
             operand,
             ..
         } => collect_ref_roots(operand, out),
-        Expr::FnLit {
-            params,
-            results,
-            body,
-            ..
-        } => {
-            let mut bound: std::collections::HashSet<String> =
-                params.iter().map(|p| p.name.clone()).collect();
-            bound.extend(results.iter().filter_map(|r| r.name.clone()));
-            crate::loans::collect_capture_idents_block(body, &mut bound, out);
-        }
         _ => {}
     }
 }

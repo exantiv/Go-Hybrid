@@ -133,6 +133,9 @@ fn check_one_closure(
                     if sb.moved.is_none() && b.moved.is_some() {
                         sb.moved = b.moved.clone();
                     }
+                    if sb.non_owned_origin.is_none() && b.non_owned_origin.is_some() {
+                        sb.non_owned_origin = b.non_owned_origin.clone();
+                    }
                 }
             }
         }
@@ -520,19 +523,11 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
                     }
                 }
                 ck.record_local_borrow_aliases(st, l);
-            } else {
+            } else if l.values.len() == 1 && l.names.len() > 1 {
                 // multi-name define from one value (`v, ok := m[k]`, `a, b := f()`)
-                let (shapes, tys) = match l.values.first() {
-                    Some(v) => (
-                        ck.multi_value_shapes(st, v, l.names.len()),
-                        ck.multi_value_tys(st, v, l.names.len()),
-                    ),
-                    None => (
-                        vec![TypeShape::Unknown; l.names.len()],
-                        vec![None; l.names.len()],
-                    ),
-                };
-                let val_opt = l.values.first();
+                let v = &l.values[0];
+                let shapes = ck.multi_value_shapes(st, v, l.names.len());
+                let tys = ck.multi_value_tys(st, v, l.names.len());
                 let resolved: Vec<(
                     String,
                     TypeShape,
@@ -547,9 +542,11 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
                     .zip(shapes)
                     .zip(tys)
                     .map(|((name, shape), ty)| {
-                        let reads_self = val_opt
-                            .map(|v| ck.value_reads_storage_of(st, v, name))
-                            .unwrap_or(false);
+                        let (shape, ty) = match (&l.ty, shape) {
+                            (Some(t), TypeShape::Unknown) => (ck.shape_of_type(t), Some(t.clone())),
+                            (_, s) => (s, ty.or_else(|| l.ty.clone())),
+                        };
+                        let reads_self = ck.value_reads_storage_of(st, v, name);
                         let shadowed_origin = if ck.shape_may_share(&shape) && reads_self {
                             ck.non_owned_origin_of(st, name).map(|(o, via_share)| {
                                 if via_share && !o.starts_with("a may-share peer of ") {
@@ -614,9 +611,7 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
                             st.share_edge(&name, &peer);
                         }
                     }
-                    if let Some(v) = val_opt {
-                        ck.record_multi_value_share_and_alias(st, &name, &shape, v);
-                    }
+                    ck.record_multi_value_share_and_alias(st, &name, &shape, v);
                     if let Some(origin) = shadowed_origin {
                         if let Some(b) = st.env_lookup_mut(&name) {
                             if b.non_owned_origin.is_none() {
@@ -624,6 +619,10 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
                             }
                         }
                     }
+                }
+            } else {
+                for name in &l.names {
+                    ck.define_binding(st, name, TypeShape::Unknown, None, immutable, managed);
                 }
             }
         }
