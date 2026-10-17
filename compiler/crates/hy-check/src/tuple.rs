@@ -70,7 +70,7 @@ impl<'a> Checker<'a> {
                 "fix: iterate over a slice (`[]T`), array (`[N]T`), string, map (`map[K]V`), channel (`chan T`), or integer range (`for i in 0..n`)".to_string(),
             ];
             self.diags.push(
-                Diagnostic::error("HYB-E2005", self.path.clone(), span, msg)
+                Diagnostic::error("HYB-E2009", self.path.clone(), span, msg)
                     .with_rule("LX13")
                     .with_notes(notes),
             );
@@ -82,21 +82,9 @@ impl<'a> Checker<'a> {
             | TypeShape::Str
             | TypeShape::Map(_, _)
             | TypeShape::Chan(_)
-            | TypeShape::BorrowHandle(_) => false,
-            TypeShape::Unknown => {
-                let msg = format!(
-                    "cannot prove `{}` is iterable — `for x in e` requires a slice, array, string, map, or channel (O4.9 / LX13)",
-                    expr.render()
-                );
-                let notes = vec![
-                    "why: the checker cannot resolve the iterable's type, and ranging over a non-iterable fails `go build` (issue #411)".to_string(),
-                    "fix: bind the iterable to a local with an explicit slice, array, string, map, or channel type before the `for ... in` loop".to_string(),
-                ];
-                self.diags.push(
-                    Diagnostic::error("HYB-E3005", self.path.clone(), span, msg).with_notes(notes),
-                );
-                true
-            }
+            | TypeShape::BorrowHandle(_)
+            | TypeShape::Unknown => false,
+            TypeShape::Pointer(inner) if matches!(*inner, TypeShape::Array(_) | TypeShape::Unknown) => false,
             other => {
                 let ty_str = self
                     .ty_of_expr(st, expr)
@@ -115,7 +103,7 @@ impl<'a> Checker<'a> {
                     "fix: iterate over a slice, array, string, map, or channel, or use an integer range `for i in 0..n`".to_string(),
                 ];
                 self.diags.push(
-                    Diagnostic::error("HYB-E2005", self.path.clone(), span, msg)
+                    Diagnostic::error("HYB-E2009", self.path.clone(), span, msg)
                         .with_rule("LX13")
                         .with_notes(notes),
                 );
@@ -483,7 +471,7 @@ fn main() {
 "#;
         assert_eq!(
             codes(src),
-            vec!["HYB-E2005", "HYB-E2005", "HYB-E2005"]
+            vec!["HYB-E2009", "HYB-E2009", "HYB-E2009"]
         );
     }
 
@@ -506,11 +494,11 @@ fn main() {
     }
 }
 "#;
-        assert_eq!(codes(src), vec!["HYB-E2005", "HYB-E2005"]);
+        assert_eq!(codes(src), vec!["HYB-E2009", "HYB-E2009"]);
     }
 
     #[test]
-    fn reject_for_in_inside_closure_and_unknown_iterable() {
+    fn reject_for_in_inside_closure_and_keep_unknown_permissive() {
         let src = r#"import "fmt"
 
 fn main() {
@@ -526,7 +514,7 @@ fn main() {
     }
 }
 "#;
-        assert_eq!(codes(src), vec!["HYB-E2005", "HYB-E3005"]);
+        assert_eq!(codes(src), vec!["HYB-E2009"]);
     }
 
     #[test]
