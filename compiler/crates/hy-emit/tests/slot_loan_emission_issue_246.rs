@@ -110,7 +110,7 @@ fn slot_loan_parallel_define_assign_and_try_in_place() {
 #[test]
 fn slot_loan_nested_field_index_snapshot_and_while_try_loop_boundary() {
     let go = emit(
-        "struct inner {\n    n int\n}\nstruct outer {\n    sub inner\n}\n\nfn next_key() string {\n    return \"a\"\n}\n\nfn step() (bool, error) {\n    return false, nil\n}\n\nfn main() {\n    m := map[string]outer{\"a\": {sub: {n: 1}}}\n    s := (&(m[next_key()].sub))\n    for step()? {\n        break\n    }\n    s.n = 9\n}\n",
+        "struct inner {\n    n int\n}\nstruct outer {\n    sub inner\n}\n\nfn next_key() string {\n    return \"a\"\n}\n\nfn step() (bool, error) {\n    return false, nil\n}\n\nfn main() {\n    m := map[string]outer{\"a\": outer{sub: inner{n: 1}}}\n    s := (&(m[next_key()].sub))\n    for step()? {\n        break\n    }\n    s.n = 9\n}\n",
     );
     assert!(
         go.contains("hyKey0 := next_key()")
