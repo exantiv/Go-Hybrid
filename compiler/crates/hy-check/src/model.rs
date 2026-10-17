@@ -809,9 +809,9 @@ pub(crate) fn collect_ref_roots(e: &Expr, out: &mut Vec<String>) {
     }
 }
 
-/// Collect root identifiers that are explicitly borrowed via address-of (`&x`) inside `e`
-/// (e.g. `[]*T{&x}`, `map[K]*T{"k": &x}`, nested composite literals, or laundered through
-/// calls/projections/indexing like `keep(&x)` or `(wrap{p: &x}).p`).
+/// Collect root identifiers that are explicitly borrowed via address-of (`&x`) inside composite literals
+/// (e.g. `[]*T{&x}`, `map[K]*T{"k": &x}`, nested composite literals).
+/// Ordinary calls, binary operations, indexing, and fields do not propagate borrow roots into results.
 pub(crate) fn collect_addr_of_roots(e: &Expr, out: &mut Vec<String>) {
     match unwrap_parens(e) {
         Expr::AddrOf { operand, .. } => {
@@ -836,17 +836,6 @@ pub(crate) fn collect_addr_of_roots(e: &Expr, out: &mut Vec<String>) {
         }
         Expr::Try { operand, .. } => collect_addr_of_roots(operand, out),
         Expr::Move { operand, .. } => collect_addr_of_roots(operand, out),
-        Expr::Slice { base, .. } => collect_addr_of_roots(base, out),
-        Expr::Field { base, .. } => collect_addr_of_roots(base, out),
-        Expr::Index { base, .. } => collect_addr_of_roots(base, out),
-        Expr::Call { callee, args, .. } => {
-            for a in args {
-                collect_addr_of_roots(&a.value, out);
-            }
-            if let Expr::Field { base, .. } = unwrap_parens(callee) {
-                collect_addr_of_roots(base, out);
-            }
-        }
         Expr::StructLit { fields, .. } => {
             for f in fields {
                 collect_addr_of_roots(&f.value, out);
@@ -861,6 +850,60 @@ pub(crate) fn collect_addr_of_roots(e: &Expr, out: &mut Vec<String>) {
         Expr::SliceLit { items, .. } => {
             for it in items {
                 collect_addr_of_roots(it, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Like [`collect_addr_of_roots`], but also follows address-of operands
+/// laundered through calls, projections, and indexing (`keep(&x)`,
+/// `(wrap{p: &x}).p`) (#435). Callers must only use this when the value's
+/// own shape can carry a borrow (pointer / borrow-handle), otherwise scalar
+/// results such as `[]int{get_val(&n)}` would be treated as borrows.
+pub(crate) fn collect_laundered_addr_of_roots(e: &Expr, out: &mut Vec<String>) {
+    match unwrap_parens(e) {
+        Expr::AddrOf { operand, .. }
+        | Expr::Unary {
+            op: hy_syntax::UnOp::Addr,
+            operand,
+            ..
+        } => {
+            if let Some(id) = operand.root_ident() {
+                if id != "_" {
+                    out.push(id.to_string());
+                }
+            }
+            collect_laundered_addr_of_roots(operand, out);
+        }
+        Expr::Try { operand, .. } | Expr::Move { operand, .. } => {
+            collect_laundered_addr_of_roots(operand, out)
+        }
+        Expr::Slice { base, .. } | Expr::Field { base, .. } | Expr::Index { base, .. } => {
+            collect_laundered_addr_of_roots(base, out)
+        }
+        Expr::Call { callee, args, .. } => {
+            for a in args {
+                collect_laundered_addr_of_roots(&a.value, out);
+            }
+            if let Expr::Field { base, .. } = unwrap_parens(callee) {
+                collect_laundered_addr_of_roots(base, out);
+            }
+        }
+        Expr::StructLit { fields, .. } => {
+            for f in fields {
+                collect_laundered_addr_of_roots(&f.value, out);
+            }
+        }
+        Expr::MapLit { entries, .. } => {
+            for (k, v) in entries {
+                collect_laundered_addr_of_roots(k, out);
+                collect_laundered_addr_of_roots(v, out);
+            }
+        }
+        Expr::SliceLit { items, .. } => {
+            for it in items {
+                collect_laundered_addr_of_roots(it, out);
             }
         }
         _ => {}

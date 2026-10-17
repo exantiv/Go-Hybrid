@@ -18,7 +18,7 @@
 
 use crate::foreign::{self, CallMode};
 use crate::model::{
-    as_addr_of, collect_addr_of_roots, collect_ref_roots, move_operand_ident, unwrap_parens, Binding, Checker, FnState,
+    as_addr_of, collect_addr_of_roots, collect_laundered_addr_of_roots, collect_ref_roots, move_operand_ident, unwrap_parens, Binding, Checker, FnState,
     Loan, LoanTarget, MoveKind, TypeShape,
 };
 use crate::shape::receiver_type_name;
@@ -3306,7 +3306,7 @@ impl<'a> Checker<'a> {
         }
         if field_borrow_kind(shape).is_some() || matches!(shape, TypeShape::Unknown) {
             let mut addr_roots = Vec::new();
-            collect_addr_of_roots(value, &mut addr_roots);
+            collect_laundered_addr_of_roots(value, &mut addr_roots);
             if field_borrow_kind(shape).is_some() && !addr_roots.is_empty() {
                 st.borrow_bindings.insert(name.to_string());
             }
@@ -5373,7 +5373,7 @@ impl<'a> Checker<'a> {
             let v_shape = self.shape_of_expr(st, v);
             let is_laundered_borrow = if field_borrow_kind(&v_shape).is_some() {
                 let mut addr_roots = Vec::new();
-                collect_addr_of_roots(v, &mut addr_roots);
+                collect_laundered_addr_of_roots(v, &mut addr_roots);
                 !addr_roots.is_empty()
             } else {
                 false
