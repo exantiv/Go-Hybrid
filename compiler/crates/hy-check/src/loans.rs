@@ -1178,24 +1178,33 @@ impl<'a> Checker<'a> {
                     };
                     let outer_exists = self.lookup_binding(st, name).is_some();
                     let prior_alias = if reads_self {
-                        st.aliases.get(name).cloned().or_else(|| {
-                            if self.shape_may_share(&shape)
-                                && outer_exists
-                                && !st.scopes.is_empty()
-                            {
-                                Some(name.clone())
-                            } else {
-                                None
-                            }
-                        })
+                        st.aliases
+                            .get(name)
+                            .cloned()
+                            .or_else(|| self.binding_const_root(st, name))
+                            .or_else(|| {
+                                if self.shape_may_share(&shape)
+                                    && outer_exists
+                                    && !st.scopes.is_empty()
+                                {
+                                    Some(name.clone())
+                                } else {
+                                    None
+                                }
+                            })
                     } else {
                         None
                     };
                     let prior_shares: Vec<String> = if reads_self {
-                        st.may_share
+                        let mut ps: Vec<String> = st
+                            .may_share
                             .get(name)
                             .map(|s| s.iter().cloned().collect())
-                            .unwrap_or_default()
+                            .unwrap_or_default();
+                        if self.binding_may_share(st, name) {
+                            ps.push(name.clone());
+                        }
+                        ps
                     } else {
                         Vec::new()
                     };
@@ -1619,7 +1628,7 @@ impl<'a> Checker<'a> {
     /// Does the binding `name` denote a value that a shallow Go copy
     /// would share mutable GC storage with? Includes file-level `const`
     /// composites (#125), which lower to package-level `var` in Go.
-    fn binding_may_share(&self, st: &FnState, name: &str) -> bool {
+    pub(crate) fn binding_may_share(&self, st: &FnState, name: &str) -> bool {
         self.lookup_binding(st, name)
             .map(|b| self.shape_may_share(&b.shape))
             .unwrap_or(false)
@@ -4042,7 +4051,10 @@ impl<'a> Checker<'a> {
                         && (self.value_reads_storage_of(st, &values[0], name)
                             || ref_roots.iter().any(|r| r == name));
                     let prior_alias = if reads_self {
-                        st.aliases.get(name).cloned()
+                        st.aliases
+                            .get(name)
+                            .cloned()
+                            .or_else(|| self.binding_const_root(st, name))
                     } else {
                         None
                     };
@@ -4061,10 +4073,15 @@ impl<'a> Checker<'a> {
                         Vec::new()
                     };
                     let prior_shares: Vec<String> = if reads_self {
-                        st.may_share
+                        let mut ps: Vec<String> = st
+                            .may_share
                             .get(name)
                             .map(|s| s.iter().cloned().collect())
-                            .unwrap_or_default()
+                            .unwrap_or_default();
+                        if self.binding_may_share(st, name) {
+                            ps.push(name.clone());
+                        }
+                        ps
                     } else {
                         Vec::new()
                     };
@@ -4107,9 +4124,7 @@ impl<'a> Checker<'a> {
                                 .extend(prior_shadows);
                         }
                         if let Some(pa) = prior_alias {
-                            if &pa != name {
-                                st.aliases.insert(name.clone(), pa);
-                            }
+                            st.aliases.insert(name.clone(), pa);
                         }
                         for child in prior_children {
                             if &child != name {
@@ -4117,7 +4132,9 @@ impl<'a> Checker<'a> {
                             }
                         }
                         for peer in prior_shares {
-                            st.share_edge(name, &peer);
+                            if &peer != name {
+                                st.share_edge(name, &peer);
+                            }
                         }
                     }
                     self.record_multi_value_share_and_alias(st, name, &shape, &values[0]);
@@ -4188,7 +4205,7 @@ impl<'a> Checker<'a> {
     /// carry `immutable: true`, and `lookup_binding` resolves locals first,
     /// so a shadowing copy is never reported). Field/index places walk to
     /// their base: `cells[0]`, `cfg.tag`, and the plain rebind `cells = ...`
-    fn binding_const_root(&self, st: &FnState, name: &str) -> Option<String> {
+    pub(crate) fn binding_const_root(&self, st: &FnState, name: &str) -> Option<String> {
         if let Some(b) = self.lookup_binding(st, name) {
             if b.immutable {
                 return Some(name.to_string());
@@ -4637,12 +4654,38 @@ impl<'a> Checker<'a> {
                         },
                     )
                     .is_some();
-            self.define_binding(st, name, shape, ty, immutable || shadowed_const, false);
+            let moved_non_owned = self.moved_non_owned_origin_in_expr(st, value);
+            let moved_const = move_operand_ident(value).is_some_and(|src| {
+                self.const_write_root(
+                    st,
+                    &Place {
+                        kind: PlaceKind::Ident(src.to_string()),
+                        span: value.span(),
+                    },
+                )
+                .is_some()
+            });
+            self.define_binding(
+                st,
+                name,
+                shape,
+                ty,
+                immutable || shadowed_const || moved_const,
+                false,
+            );
+            if let Some(origin) = moved_non_owned {
+                if let Some(b) = st.env_lookup_mut(name) {
+                    if b.non_owned_origin.is_none() {
+                        b.non_owned_origin = Some(origin);
+                    }
+                }
+            }
             if move_operand_ident(value).is_none() {
                 self.record_may_share(st, name, value);
                 self.record_alias(st, name, value);
             }
         }
+        self.record_local_borrow_aliases(st, l);
     }
 
     fn check_delete_const(&mut self, st: &FnState, cr: &CallRef, declared: &HashSet<String>) {

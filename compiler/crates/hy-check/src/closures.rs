@@ -563,24 +563,33 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
                         };
                         let outer_exists = ck.lookup_binding(st, name).is_some();
                         let prior_alias = if reads_self {
-                            st.aliases.get(name).cloned().or_else(|| {
-                                if ck.shape_may_share(&shape)
-                                    && outer_exists
-                                    && !st.scopes.is_empty()
-                                {
-                                    Some(name.clone())
-                                } else {
-                                    None
-                                }
-                            })
+                            st.aliases
+                                .get(name)
+                                .cloned()
+                                .or_else(|| ck.binding_const_root(st, name))
+                                .or_else(|| {
+                                    if ck.shape_may_share(&shape)
+                                        && outer_exists
+                                        && !st.scopes.is_empty()
+                                    {
+                                        Some(name.clone())
+                                    } else {
+                                        None
+                                    }
+                                })
                         } else {
                             None
                         };
                         let prior_shares: Vec<String> = if reads_self {
-                            st.may_share
+                            let mut ps: Vec<String> = st
+                                .may_share
                                 .get(name)
                                 .map(|s| s.iter().cloned().collect())
-                                .unwrap_or_default()
+                                .unwrap_or_default();
+                            if ck.binding_may_share(st, name) {
+                                ps.push(name.clone());
+                            }
+                            ps
                         } else {
                             Vec::new()
                         };
