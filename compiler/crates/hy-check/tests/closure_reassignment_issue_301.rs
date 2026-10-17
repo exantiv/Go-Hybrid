@@ -1,13 +1,12 @@
-use hy_check::check_file;
-use hy_diag::Verdict;
+use hy_check::{check_file, CheckResult, Verdict};
 use hy_syntax::parse_file;
 
-fn check(src: &str) -> hy_diag::CheckOutput {
+fn check(src: &str) -> CheckResult {
     let file = parse_file("test.hy", src).expect("parse");
-    check_file("test.hy", &file)
+    check_file(&file)
 }
 
-fn codes(out: &hy_diag::CheckOutput) -> Vec<String> {
+fn codes(out: &CheckResult) -> Vec<String> {
     out.diagnostics.iter().map(|d| d.code.clone()).collect()
 }
 
@@ -32,7 +31,7 @@ fn closure_direct_and_block_scoped_reassignment_to_captured_rejects_e3004() {
 fn closure_multi_value_define_from_captured_rejects_e3004() {
     // `alias, ok := m["k"]` inside a closure where `m` is a captured nested map
     let r_map_ok = check(
-        "fn worker(m map[string]int, done chan bool) {\n    m[\"x\"] = 1\n    done <- true\n}\n\nfn main() {\n    m := map[string]map[string]int{\"k\": {\"x\": 0}}\n    done := make(chan bool, 1)\n    spawn_it := fn() {\n        alias, ok := m[\"k\"]\n        if ok {\n            task worker(move alias, done)\n        }\n    }\n    spawn_it()\n    <-done\n}\n",
+        "fn worker(m map[string]int, done chan bool) {\n    m[\"x\"] = 1\n    done <- true\n}\n\nfn main() {\n    m := map[string]map[string]int{\"k\": map[string]int{\"x\": 0}}\n    done := make(chan bool, 1)\n    spawn_it := fn() {\n        alias, ok := m[\"k\"]\n        if ok {\n            task worker(move alias, done)\n        }\n    }\n    spawn_it()\n    <-done\n}\n",
     );
     assert_eq!(r_map_ok.verdict, Verdict::Reject, "got {:?}", r_map_ok.diagnostics);
     assert!(codes(&r_map_ok).iter().any(|c| c == "HYB-E3004"));
