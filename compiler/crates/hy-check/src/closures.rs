@@ -734,6 +734,7 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
             );
         }
         Stmt::Defer { call, .. } => {
+            ck.check_stmt_defer_call(stmt);
             ck.mark_move_in_value(
                 st,
                 call,
