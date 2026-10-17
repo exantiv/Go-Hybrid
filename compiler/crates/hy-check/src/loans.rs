@@ -1927,18 +1927,23 @@ impl<'a> Checker<'a> {
                         }
                     }
                 }
-                let mut addr_roots = Vec::new();
-                self.collect_borrowed_roots(st, value, &mut addr_roots);
-                for root in addr_roots {
-                    if root != name {
-                        st.share_edge(name, &root);
-                        let origin = self
-                            .lookup_binding(st, &root)
-                            .and_then(|b| b.non_owned_origin.clone());
-                        if let Some(origin) = origin {
-                            if let Some(nb) = st.env_lookup_mut(name) {
-                                if nb.non_owned_origin.is_none() {
-                                    nb.non_owned_origin = Some(origin);
+                if is_literal
+                    || self.shape_may_share(&result)
+                    || matches!(result, TypeShape::Unknown)
+                {
+                    let mut addr_roots = Vec::new();
+                    self.collect_borrowed_roots(st, value, &mut addr_roots);
+                    for root in addr_roots {
+                        if root != name {
+                            st.share_edge(name, &root);
+                            let origin = self
+                                .lookup_binding(st, &root)
+                                .and_then(|b| b.non_owned_origin.clone());
+                            if let Some(origin) = origin {
+                                if let Some(nb) = st.env_lookup_mut(name) {
+                                    if nb.non_owned_origin.is_none() {
+                                        nb.non_owned_origin = Some(origin);
+                                    }
                                 }
                             }
                         }
@@ -2897,24 +2902,38 @@ impl<'a> Checker<'a> {
 
     /// Record O5.2 alias links for pointer borrows (`p := &stats`, `slot := &m[k]`)
     /// so moving `p` freezes the underlying mutable binding `stats` (#33).
-    /// pr-312 / #131: the alias recording descends into nested address-of
-    /// operands and auto-addressed `*T` call arguments/receivers via
-    /// `collect_borrowed_roots`, not just the direct `as_addr_of` form.
+    /// pr-312 / #131 / #435: the alias recording descends into nested address-of
+    /// operands inside composite literals (`p := stats{cpu: &usage}`),
+    /// auto-addressed `*T` call arguments/receivers, and pointer-returning
+    /// calls/projections (`p := keep(&h)`) via `collect_borrowed_roots`,
+    /// not just the direct `as_addr_of` form.
     pub(crate) fn record_local_borrow_aliases(&self, st: &mut FnState, l: &LocalDecl) {
         if l.names.len() == l.values.len() {
             for (name, value) in l.names.iter().zip(l.values.iter()) {
-                if self.expr_carries_borrow(st, value) {
+                if name == "_" {
+                    continue;
+                }
+                let inner = unwrap_parens(value);
+                let shape = self.shape_of_expr(st, value);
+                let mut addr_roots = Vec::new();
+                if field_borrow_kind(&shape).is_some() || matches!(shape, TypeShape::Unknown) {
+                    self.collect_borrowed_roots(st, value, &mut addr_roots);
+                }
+                let is_borrow = self.expr_carries_borrow(st, value)
+                    || as_addr_of(inner).is_some()
+                    || contains_addr_of_in_literal(inner)
+                    || (field_borrow_kind(&shape).is_some() && !addr_roots.is_empty())
+                    || matches!(inner, Expr::Ident { name: src, .. } if st.borrow_bindings.contains(src));
+                if is_borrow {
                     st.borrow_bindings.insert(name.clone());
                 } else {
                     st.borrow_bindings.remove(name);
                 }
                 if move_operand_ident(value).is_none() {
-                    let shape = self.shape_of_expr(st, value);
                     if field_borrow_kind(&shape).is_none() && !matches!(shape, TypeShape::Unknown) {
                         continue;
                     }
-                    let mut addr_roots = Vec::new();
-                    self.collect_borrowed_roots(st, value, &mut addr_roots);
+                    let mut aliased = false;
                     for src in addr_roots {
                         if src != *name {
                             let matched = self.lookup_binding(st, &src).map(|b| {
@@ -2923,7 +2942,11 @@ impl<'a> Checker<'a> {
                                 (ok, b.non_owned_origin.clone())
                             });
                             if let Some((true, origin)) = matched {
-                                st.aliases.insert(name.clone(), src);
+                                st.share_edge(name, &src);
+                                if !aliased {
+                                    st.aliases.insert(name.clone(), src);
+                                    aliased = true;
+                                }
                                 if let Some(origin) = origin {
                                     if let Some(nb) = st.env_lookup_mut(name) {
                                         if nb.non_owned_origin.is_none() {
@@ -2931,7 +2954,6 @@ impl<'a> Checker<'a> {
                                         }
                                     }
                                 }
-                                break;
                             }
                         }
                     }
@@ -2941,7 +2963,7 @@ impl<'a> Checker<'a> {
     }
 
     /// Record O5.2 alias links for pointer-borrow rebinds (`p = &stats`).
-    /// pr-312 / #131: nested address-of operands and auto-addressed `*T`
+    /// pr-312 / #131 / #435: nested address-of operands and auto-addressed `*T`
     /// call arguments/receivers are tracked the same way as the define form.
     pub(crate) fn record_assign_borrow_aliases(
         &self,
@@ -2958,8 +2980,15 @@ impl<'a> Checker<'a> {
                         continue;
                     }
                     let inner = unwrap_parens(v);
-                    let is_borrow = as_addr_of(inner).is_some()
+                    let shape = self.shape_of_expr(st, v);
+                    let mut addr_roots = Vec::new();
+                    if field_borrow_kind(&shape).is_some() || matches!(shape, TypeShape::Unknown) {
+                        self.collect_borrowed_roots(st, v, &mut addr_roots);
+                    }
+                    let is_borrow = carries_borrow
+                        || as_addr_of(inner).is_some()
                         || contains_addr_of_in_literal(inner)
+                        || (field_borrow_kind(&shape).is_some() && !addr_roots.is_empty())
                         || matches!(inner, Expr::Ident { name: src, .. } if st.borrow_bindings.contains(src));
                     if is_borrow {
                         st.borrow_bindings.insert(name.clone());
@@ -2967,12 +2996,10 @@ impl<'a> Checker<'a> {
                         st.borrow_bindings.remove(name);
                     }
                     if move_operand_ident(v).is_none() {
-                        let shape = self.shape_of_expr(st, v);
                         if field_borrow_kind(&shape).is_none() && !matches!(shape, TypeShape::Unknown) {
                             continue;
                         }
-                        let mut addr_roots = Vec::new();
-                        self.collect_borrowed_roots(st, v, &mut addr_roots);
+                        let mut aliased = false;
                         for src in addr_roots {
                             if src != *name {
                                 let matched = self.lookup_binding(st, &src).map(|b| {
@@ -2981,7 +3008,11 @@ impl<'a> Checker<'a> {
                                     (ok, b.non_owned_origin.clone())
                                 });
                                 if let Some((true, origin)) = matched {
-                                    st.aliases.insert(name.clone(), src);
+                                    st.share_edge(name, &src);
+                                    if !aliased {
+                                        st.aliases.insert(name.clone(), src);
+                                        aliased = true;
+                                    }
                                     if let Some(origin) = origin {
                                         if let Some(nb) = st.env_lookup_mut(name) {
                                             if nb.non_owned_origin.is_none() {
@@ -2989,7 +3020,6 @@ impl<'a> Checker<'a> {
                                             }
                                         }
                                     }
-                                    break;
                                 }
                             }
                         }
@@ -3089,13 +3119,9 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// Record may-share edges for one target `name` (or non-Ident root) of a
-    /// multi-value define or assignment using that target's resolved `shape`.
-    /// Multi-value define share/alias recording (#457): a multi-value
-    /// define (`a, b := f()`) whose value shares storage records may-share
-    /// edges and reference-alias links for EACH named result against the
-    /// value's ref roots — including the outer-scope shadow link for a
-    /// define that shadows a captured reference alias.
+    /// Record may-share and alias edges for one target `name` of a multi-value
+    /// define or assignment (`h2, ok := alias_pair(h)`, `m, ok := buckets[k]`)
+    /// using that target's resolved `shape` (#75, #435, #457).
     pub(crate) fn record_multi_value_share_and_alias(
         &self,
         st: &mut FnState,
@@ -3275,6 +3301,42 @@ impl<'a> Checker<'a> {
                         }
                     }
                     break;
+                }
+            }
+        }
+        if field_borrow_kind(shape).is_some() || matches!(shape, TypeShape::Unknown) {
+            let mut addr_roots = Vec::new();
+            collect_addr_of_roots(value, &mut addr_roots);
+            if field_borrow_kind(shape).is_some() && !addr_roots.is_empty() {
+                st.borrow_bindings.insert(name.to_string());
+            }
+            let mut aliased = st.aliases.contains_key(name);
+            for src in addr_roots {
+                if src != name {
+                    if let Some(b) = self.lookup_binding(st, &src) {
+                        let origin = b.non_owned_origin.clone();
+                        if !b.shape.is_sendable_by_type() {
+                            st.share_edge(name, &src);
+                            if !aliased {
+                                st.aliases.insert(name.to_string(), src);
+                                aliased = true;
+                            }
+                        }
+                        if let Some(origin) = origin {
+                            if let Some(nb) = st.env_lookup_mut(name) {
+                                if nb.non_owned_origin.is_none() {
+                                    nb.non_owned_origin = Some(origin);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(origin) = self.moved_non_owned_origin_in_expr(st, value) {
+            if let Some(nb) = st.env_lookup_mut(name) {
+                if nb.non_owned_origin.is_none() {
+                    nb.non_owned_origin = Some(origin);
                 }
             }
         }
@@ -5308,11 +5370,20 @@ impl<'a> Checker<'a> {
                 }
                 _ => false,
             };
+            let v_shape = self.shape_of_expr(st, v);
+            let is_laundered_borrow = if field_borrow_kind(&v_shape).is_some() {
+                let mut addr_roots = Vec::new();
+                collect_addr_of_roots(v, &mut addr_roots);
+                !addr_roots.is_empty()
+            } else {
+                false
+            };
             // O2/LOAN-ESCAPE: a borrow returned from a function
             if as_addr_of(v).is_some()
                 || contains_addr_of_in_literal(v)
                 || is_bound_borrow
                 || self.expr_carries_borrow(st, v)
+                || is_laundered_borrow
             {
                 let msg = "a borrow cannot be returned from a function".to_string();
                 let notes = vec![

@@ -805,24 +805,13 @@ pub(crate) fn collect_ref_roots(e: &Expr, out: &mut Vec<String>) {
             operand,
             ..
         } => collect_ref_roots(operand, out),
-        Expr::FnLit {
-            params,
-            results,
-            body,
-            ..
-        } => {
-            let mut bound: std::collections::HashSet<String> =
-                params.iter().map(|p| p.name.clone()).collect();
-            bound.extend(results.iter().filter_map(|r| r.name.clone()));
-            crate::loans::collect_capture_idents_block(body, &mut bound, out);
-        }
         _ => {}
     }
 }
 
-/// Collect root identifiers that are explicitly borrowed via address-of (`&x`) inside composite literals
-/// (e.g. `[]*T{&x}`, `map[K]*T{"k": &x}`, nested composite literals).
-/// Ordinary calls, binary operations, indexing, and fields do not propagate borrow roots into results.
+/// Collect root identifiers that are explicitly borrowed via address-of (`&x`) inside `e`
+/// (e.g. `[]*T{&x}`, `map[K]*T{"k": &x}`, nested composite literals, or laundered through
+/// calls/projections/indexing like `keep(&x)` or `(wrap{p: &x}).p`).
 pub(crate) fn collect_addr_of_roots(e: &Expr, out: &mut Vec<String>) {
     match unwrap_parens(e) {
         Expr::AddrOf { operand, .. } => {
@@ -847,6 +836,17 @@ pub(crate) fn collect_addr_of_roots(e: &Expr, out: &mut Vec<String>) {
         }
         Expr::Try { operand, .. } => collect_addr_of_roots(operand, out),
         Expr::Move { operand, .. } => collect_addr_of_roots(operand, out),
+        Expr::Slice { base, .. } => collect_addr_of_roots(base, out),
+        Expr::Field { base, .. } => collect_addr_of_roots(base, out),
+        Expr::Index { base, .. } => collect_addr_of_roots(base, out),
+        Expr::Call { callee, args, .. } => {
+            for a in args {
+                collect_addr_of_roots(&a.value, out);
+            }
+            if let Expr::Field { base, .. } = unwrap_parens(callee) {
+                collect_addr_of_roots(base, out);
+            }
+        }
         Expr::StructLit { fields, .. } => {
             for f in fields {
                 collect_addr_of_roots(&f.value, out);
