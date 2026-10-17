@@ -1508,6 +1508,9 @@ impl Emitter {
         if let ForKind::While { cond } = kind {
             if Self::expr_has_hoistable_try(cond) {
                 self.push("for {");
+                self.for_depth += 1;
+                let sentinel_label = label.clone().unwrap_or_default();
+                self.loan_frames.push(vec![(String::new(), sentinel_label)]);
                 self.loan_frames.push(Vec::new());
                 self.indent += 1;
                 self.hoist_tries_expr(cond)?;
@@ -1517,9 +1520,15 @@ impl Emitter {
                 self.push("break");
                 self.indent -= 1;
                 self.push("}");
-                self.emit_stmts_with_loans(&body.stmts)?;
+                let body_r = self.emit_stmts_with_loans(&body.stmts);
                 self.indent -= 1;
+                self.loan_frames.pop();
+                self.for_depth -= 1;
+                body_r?;
                 self.push("}");
+                if label.is_some() {
+                    self.loop_labels.pop();
+                }
                 return Ok(());
             }
         }
@@ -2057,42 +2066,61 @@ impl Emitter {
 
     /// Returns `Some(operand)` when `expr` is an O8 slot-loan `&m[k]` or `&s.field`.
     fn as_slot_loan_operand(expr: &Expr) -> Option<&Expr> {
-        match expr {
+        match Self::peel_parens(expr) {
             Expr::AddrOf { operand, .. }
             | Expr::Unary {
                 op: UnOp::Addr,
                 operand,
                 ..
-            } if matches!(operand.as_ref(), Expr::Index { .. } | Expr::Field { .. }) => {
-                Some(operand.as_ref())
+            } => {
+                let inner = Self::peel_parens(operand.as_ref());
+                if matches!(inner, Expr::Index { .. } | Expr::Field { .. }) {
+                    Some(inner)
+                } else {
+                    None
+                }
             }
             _ => None,
         }
     }
 
     /// Emits the read-place and store-back-place for an O8 slot loan `&operand`
-    /// bound to `loan_var`, snapshotting the index expression into a fresh
+    /// bound to `loan_var`, snapshotting any index expression into a fresh
     /// `hyKeyN` temporary when the index is non-trivial or is mutated before
-    /// the loan's store-back.
+    /// the loan's store-back (including nested chains such as `&m[k].field` or
+    /// `&m[k1][k2]`).
     fn emit_slot_loan_place(
         &mut self,
         operand: &Expr,
         loan_var: &str,
         rest: &[Stmt],
     ) -> Result<(String, String), EmitError> {
-        if let Expr::Index { base, index, .. } = operand {
-            let needs_key_snapshot = match index.as_ref() {
-                Expr::Lit { .. } => false,
-                Expr::Ident { name, .. } => {
-                    name == loan_var
-                        || rest.iter().any(|s| Self::stmt_modifies_ident(s, name))
-                }
-                _ => true,
-            };
-            let base_mentions_loan_var =
-                loan_var != "_" && Self::expr_mentions_ident(base, loan_var);
-            if needs_key_snapshot || base_mentions_loan_var {
-                let base_text = self.emit_expr(base, ATOM)?;
+        let place = self.emit_slot_loan_place_inner(operand, loan_var, rest)?;
+        Ok((place.clone(), place))
+    }
+
+    fn emit_slot_loan_place_inner(
+        &mut self,
+        operand: &Expr,
+        loan_var: &str,
+        rest: &[Stmt],
+    ) -> Result<String, EmitError> {
+        match Self::peel_parens(operand) {
+            Expr::Index { base, index, .. } => {
+                let base_text = match Self::peel_parens(base) {
+                    Expr::Index { .. } | Expr::Field { .. } => {
+                        self.emit_slot_loan_place_inner(base, loan_var, rest)?
+                    }
+                    _ => self.emit_expr(base, ATOM)?,
+                };
+                let needs_key_snapshot = match Self::peel_parens(index) {
+                    Expr::Lit { .. } => false,
+                    Expr::Ident { name, .. } => {
+                        name == loan_var
+                            || rest.iter().any(|s| Self::stmt_modifies_ident(s, name))
+                    }
+                    _ => true,
+                };
                 let idx_text = self.emit_expr(index, 0)?;
                 let key_place = if needs_key_snapshot {
                     let kt = self.next_temp("hyKey");
@@ -2101,12 +2129,20 @@ impl Emitter {
                 } else {
                     idx_text
                 };
-                let place = format!("{}[{}]", base_text, key_place);
-                return Ok((place.clone(), place));
+                Ok(format!("{}[{}]", base_text, key_place))
             }
+            Expr::Field { base, name, .. } => {
+                let base_text = match Self::peel_parens(base) {
+                    Expr::Index { .. } | Expr::Field { .. } => {
+                        self.emit_slot_loan_place_inner(base, loan_var, rest)?
+                    }
+                    _ => self.emit_expr(base, ATOM)?,
+                };
+                let m = self.member_name(base, name);
+                Ok(format!("{}.{}", base_text, m))
+            }
+            other => self.emit_expr(other, 0),
         }
-        let place = self.emit_expr(operand, 0)?;
-        Ok((place.clone(), place))
     }
 
     /// Flushes and removes any active slot-loan entries for `target_name` in
