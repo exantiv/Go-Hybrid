@@ -38,15 +38,42 @@ pub(crate) fn resolve_alias(st: &FnState, name: &str) -> String {
     cur
 }
 
+/// Transitive connected component of `seed` across both `aliases` (parent and
+/// child directions) and `may_share`, including `seed` itself.
+fn storage_component(st: &FnState, seed: &str) -> HashSet<String> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut stack = vec![seed.to_string()];
+    while let Some(cur) = stack.pop() {
+        if !seen.insert(cur.clone()) {
+            continue;
+        }
+        if let Some(parent) = st.aliases.get(&cur) {
+            if !seen.contains(parent) {
+                stack.push(parent.clone());
+            }
+        }
+        for (child, parent) in &st.aliases {
+            if parent == &cur && !seen.contains(child) {
+                stack.push(child.clone());
+            }
+        }
+        if let Some(peers) = st.may_share.get(&cur) {
+            for p in peers {
+                if !seen.contains(p) {
+                    stack.push(p.clone());
+                }
+            }
+        }
+    }
+    seen
+}
+
 fn same_or_shared(st: &FnState, a: &str, root_a: &str, b: &str, root_b: &str) -> bool {
     if root_a == root_b {
         return true;
     }
-    let mut group = st.share_group(a);
-    if root_a != a {
-        group.extend(st.share_group(root_a));
-    }
-    group.contains(b) || group.contains(root_b)
+    let comp = storage_component(st, a);
+    comp.contains(b) || comp.contains(root_b)
 }
 
 impl<'a> Checker<'a> {
@@ -245,24 +272,12 @@ impl<'a> Checker<'a> {
         desc: String,
         kind: MoveKind,
     ) {
-        let root = resolve_alias(st, name);
-        let mut members: Vec<String> = vec![name.to_string(), root.clone()];
-        for a in st.aliases.keys() {
-            if resolve_alias(st, a) == root {
-                members.push(a.clone());
-            }
-        }
-        // #27: a move also freezes everything that may share the same mutable
-        // GC storage — shallow struct/array copies, re-slices, field/index
-        // projections, and composite literals that embedded a live binding.
-        // The single-parent `aliases` chain above cannot express that graph,
-        // so union in the may-share connected component of every member.
-        let seeded = members.clone();
-        for m in seeded {
-            members.extend(st.share_group(&m));
-        }
+        // #27 / #131: a move freezes every binding in the transitive connected
+        // component of `name` across both `aliases` (parent and child
+        // directions) and `may_share` — including multi-hop chains such as a
+        // pointer borrow embedded in a composite literal (`p := &h; xs := []*holder{p}`).
+        let mut members: Vec<String> = storage_component(st, name).into_iter().collect();
         members.sort();
-        members.dedup();
         let mut origins = Vec::new();
         for m in &members {
             let o = self.non_owned_origin_of(st, m).map(|(orig, via_share)| {
@@ -273,6 +288,12 @@ impl<'a> Checker<'a> {
                 }
             });
             origins.push(o);
+        }
+        let mut shadow_targets: Vec<(String, usize)> = Vec::new();
+        for m in &members {
+            if let Some(links) = st.shadow_links.get(m) {
+                shadow_targets.extend(links.iter().cloned());
+            }
         }
         for (m, orig) in members.iter().zip(origins) {
             if let Some(b) = st.env_lookup_mut(m) {
@@ -294,6 +315,42 @@ impl<'a> Checker<'a> {
                     });
                     st.env.insert(m.clone(), frozen);
                 }
+            }
+        }
+        for (outer_name, depth) in shadow_targets {
+            if let Some(b) = st.binding_at_depth_mut(&outer_name, depth) {
+                if b.moved.is_none() {
+                    b.moved = Some(MoveInfo {
+                        span,
+                        kind,
+                        desc: desc.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    /// Process a place expression (assignment target) that may carry a move
+    /// transfer inside its base or index expression (`(move m)["k"] = 1`,
+    /// `m[idx(move x)] = 1`).
+    pub(crate) fn mark_move_in_place(
+        &mut self,
+        st: &mut FnState,
+        place: &hy_syntax::Place,
+    ) {
+        match &place.kind {
+            hy_syntax::PlaceKind::Ident(_) => {}
+            hy_syntax::PlaceKind::Field { base, .. }
+            | hy_syntax::PlaceKind::AddrOf { base } => {
+                self.mark_move_in_place(st, base);
+            }
+            hy_syntax::PlaceKind::Index { base, index } => {
+                self.mark_move_in_place(st, base);
+                self.mark_move_in_value(
+                    st,
+                    index,
+                    format!("the index expression `{}`", index.render()),
+                );
             }
         }
     }
@@ -472,15 +529,20 @@ impl<'a> Checker<'a> {
         //     the situation moving the parameter itself is rejected for.
         //     Peers are scanned in sorted order for deterministic
         //     diagnostics.
-        let mut origin: Option<(String, bool)> = own.map(|o| (o, false));
-        if origin.is_none() {
-            let mut all_peers = st.share_group(name);
-            if root != name {
-                all_peers.extend(st.share_group(&root));
+        let mut origin: Option<(String, bool)> = own.map(|o| {
+            if let Some(rest) = o.strip_prefix("a may-share peer of ") {
+                (rest.to_string(), true)
+            } else {
+                (o, false)
             }
-            let mut peers: Vec<String> = all_peers.into_iter().collect();
+        });
+        if origin.is_none() {
+            let mut peers: Vec<String> = storage_component(st, name).into_iter().collect();
             peers.sort();
             for peer in peers {
+                if peer == name {
+                    continue;
+                }
                 let proot = resolve_alias(st, &peer);
                 let po = self
                     .lookup_binding(st, &peer)
@@ -490,7 +552,11 @@ impl<'a> Checker<'a> {
                             .and_then(|rb| rb.non_owned_origin.clone())
                     });
                 if let Some(po) = po {
-                    origin = Some((po, true));
+                    let clean = po
+                        .strip_prefix("a may-share peer of ")
+                        .unwrap_or(&po)
+                        .to_string();
+                    origin = Some((clean, true));
                     break;
                 }
             }
@@ -564,19 +630,6 @@ impl<'a> Checker<'a> {
         }
 
         let mut shadow_scopes: Vec<HashSet<String>> = vec![HashSet::new()];
-        if let Some((_, hy_syntax::Stmt::For { kind, .. })) = loop_stmts.first().map(|(s, idx)| (*idx, *s)) {
-            match kind {
-                hy_syntax::ForKind::Range { var, .. } => {
-                    shadow_scopes[0].insert(var.clone());
-                }
-                hy_syntax::ForKind::Iterate { vars, .. } => {
-                    for v in vars {
-                        shadow_scopes[0].insert(v.clone());
-                    }
-                }
-                _ => {}
-            }
-        }
 
         for (i, (stmt, stmt_idx)) in loop_stmts.iter().enumerate() {
             if i > 0 {
@@ -601,21 +654,6 @@ impl<'a> Checker<'a> {
                                     top.insert(name.to_string());
                                 }
                             }
-                        }
-                    }
-                }
-                if let hy_syntax::Stmt::For { kind, .. } = stmt {
-                    if let Some(top) = shadow_scopes.last_mut() {
-                        match kind {
-                            hy_syntax::ForKind::Range { var, .. } => {
-                                top.insert(var.clone());
-                            }
-                            hy_syntax::ForKind::Iterate { vars, .. } => {
-                                for v in vars {
-                                    top.insert(v.clone());
-                                }
-                            }
-                            _ => {}
                         }
                     }
                 }
@@ -671,14 +709,30 @@ impl<'a> Checker<'a> {
                 }
             }
 
-            if i > 0 {
-                if let hy_syntax::Stmt::Local(l) = stmt {
+            match stmt {
+                hy_syntax::Stmt::Local(l) if i > 0 => {
                     if let Some(top) = shadow_scopes.last_mut() {
                         for name in &l.names {
                             top.insert(name.clone());
                         }
                     }
                 }
+                hy_syntax::Stmt::For { kind, .. } => {
+                    if let Some(top) = shadow_scopes.last_mut() {
+                        match kind {
+                            hy_syntax::ForKind::Range { var, .. } => {
+                                top.insert(var.clone());
+                            }
+                            hy_syntax::ForKind::Iterate { vars, .. } => {
+                                for v in vars {
+                                    top.insert(v.clone());
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }

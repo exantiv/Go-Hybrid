@@ -11,14 +11,23 @@ use crate::model::{unwrap_parens, Checker};
 use hy_diag::{Diagnostic, Span};
 use hy_syntax::{
     AssignOp, BinOp, Expr, ForKind, InterpPart, LitKind, Place, PlaceKind, SelectArmKind,
-    Stmt,
+    Stmt, UnOp,
 };
 
 impl<'a> Checker<'a> {
     /// Pass-B entry: walk the same expression surface as `walk::own_uses`.
     /// Nested block bodies are NOT recursed here — `walk::flatten` already
     /// lists those statements, and a second walk would duplicate diagnostics.
+    pub(crate) fn check_file_const_zero_divisors(&mut self) {
+        for d in &self.file.decls {
+            if let hy_syntax::Decl::Const(c) = d {
+                self.check_expr_const_zero_divisor(&c.value);
+            }
+        }
+    }
+
     pub(crate) fn check_stmt_const_zero_divisor(&mut self, stmt: &Stmt) {
+        self.check_file_close_and_range_directions(stmt);
         self.check_stmt_const_zero_divisor_inner(stmt, /*deep=*/ false);
     }
 
@@ -134,7 +143,7 @@ impl<'a> Checker<'a> {
             Stmt::Select { arms, .. } => {
                 for arm in arms {
                     match &arm.kind {
-                        SelectArmKind::Send { chan, value } => {
+                        SelectArmKind::Send { chan, value, .. } => {
                             self.check_expr_const_zero_divisor(chan);
                             self.check_expr_const_zero_divisor(value);
                         }
@@ -266,20 +275,76 @@ fn assign_op_txt(op: AssignOp) -> &'static str {
     }
 }
 
+pub(crate) fn is_constant_zero(expr: &Expr) -> bool {
+    const_eval_int(expr) == Some(0)
+}
+
 fn is_int_literal_zero(expr: &Expr) -> bool {
+    is_constant_zero(expr)
+}
+
+pub(crate) fn const_eval_int(expr: &Expr) -> Option<i128> {
     match unwrap_parens(expr) {
         Expr::Lit {
             kind: LitKind::Int(raw),
             ..
-        } => int_lit_is_zero(raw),
-        _ => false,
+        } => int_lit_value(raw),
+        Expr::Unary { op, operand, .. } => {
+            let val = const_eval_int(operand)?;
+            match op {
+                UnOp::Neg => val.checked_neg(),
+                _ => None,
+            }
+        }
+        Expr::Binary { op, lhs, rhs, .. } => {
+            let l = const_eval_int(lhs)?;
+            let r = const_eval_int(rhs)?;
+            match op {
+                BinOp::Add => l.checked_add(r),
+                BinOp::Sub => l.checked_sub(r),
+                BinOp::Mul => l.checked_mul(r),
+                BinOp::Div => {
+                    if r != 0 {
+                        l.checked_div(r)
+                    } else {
+                        None
+                    }
+                }
+                BinOp::Mod => {
+                    if r != 0 {
+                        l.checked_rem(r)
+                    } else {
+                        None
+                    }
+                }
+                BinOp::BitAnd => Some(l & r),
+                BinOp::BitOr => Some(l | r),
+                BinOp::BitXor => Some(l ^ r),
+                BinOp::Shl => {
+                    if r >= 0 && r < 128 {
+                        l.checked_shl(r as u32)
+                    } else {
+                        None
+                    }
+                }
+                BinOp::Shr => {
+                    if r >= 0 && r < 128 {
+                        l.checked_shr(r as u32)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 
-fn int_lit_is_zero(raw: &str) -> bool {
+pub(crate) fn int_lit_value(raw: &str) -> Option<i128> {
     let s: String = raw.chars().filter(|c| *c != '_').collect();
     if s.is_empty() {
-        return false;
+        return None;
     }
     let (radix, digits) = if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"))
     {
@@ -288,25 +353,53 @@ fn int_lit_is_zero(raw: &str) -> bool {
         (8, rest)
     } else if let Some(rest) = s.strip_prefix("0b").or_else(|| s.strip_prefix("0B")) {
         (2, rest)
+    } else if s.len() > 1 && s.starts_with('0') {
+        if s.chars().any(|c| c == '8' || c == '9') {
+            return None;
+        }
+        (8, s.as_str())
     } else {
         (10, s.as_str())
     };
     if digits.is_empty() {
-        return false;
+        return None;
     }
-    u128::from_str_radix(digits, radix)
-        .map(|v| v == 0)
-        .unwrap_or(false)
+    i128::from_str_radix(digits, radix).ok()
+}
+
+#[allow(dead_code)]
+fn int_lit_is_zero(raw: &str) -> bool {
+    int_lit_value(raw) == Some(0)
 }
 
 #[cfg(test)]
 mod lit_zero_tests {
-    use super::int_lit_is_zero;
+    use super::{int_lit_is_zero, is_int_literal_zero};
+    use hy_diag::{Pos, Span};
+    use hy_syntax::{Expr, LitKind, UnOp};
+
+    fn make_int(s: &str) -> Expr {
+        Expr::Lit {
+            kind: LitKind::Int(s.to_string()),
+            span: Span::new(Pos::new(1, 1), Pos::new(1, 1)),
+        }
+    }
+
+    fn make_neg(inner: Expr) -> Expr {
+        Expr::Unary {
+            op: UnOp::Neg,
+            operand: Box::new(inner),
+            span: Span::new(Pos::new(1, 1), Pos::new(1, 1)),
+        }
+    }
 
     #[test]
     fn recognizes_zero_spellings() {
         for s in ["0", "00", "0_0", "0x0", "0X00", "0o0", "0b0", "0b000"] {
             assert!(int_lit_is_zero(s), "{s}");
+            assert!(is_int_literal_zero(&make_int(s)), "{s}");
+            assert!(is_int_literal_zero(&make_neg(make_int(s))), "-{s}");
+            assert!(is_int_literal_zero(&make_neg(make_neg(make_int(s)))), "--{s}");
         }
     }
 
@@ -314,6 +407,8 @@ mod lit_zero_tests {
     fn rejects_nonzero() {
         for s in ["1", "10", "0x1", "0b1", "0o7", "00_1"] {
             assert!(!int_lit_is_zero(s), "{s}");
+            assert!(!is_int_literal_zero(&make_int(s)), "{s}");
+            assert!(!is_int_literal_zero(&make_neg(make_int(s))), "-{s}");
         }
     }
 }

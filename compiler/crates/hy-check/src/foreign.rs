@@ -108,6 +108,16 @@ pub(crate) fn foreign_named_type(name: &str) -> Option<TypeShape> {
     }
 }
 
+/// The foreign handles the emitter ranges as element sources — the
+/// `ForeignTy` range branch in `hy-emit`'s statement emission, keyed by the
+/// same descriptors as the emitter's SHAPES table. `serde_json.value` is the
+/// element-source handle (corpus 05 ranges `doc.array(...)` views and the
+/// emitter supports ranging the value handle itself); other handles (e.g.
+/// `flate2.writer`) are NOT iterable and must stay rejected (issue #411).
+pub(crate) fn is_iterable_handle(name: &str) -> bool {
+    name == "serde_json.value"
+}
+
 /// Mode of a package-level call: `serde_json.parse(...)`, `fmt.println(...)`.
 pub(crate) fn package_mode(pkg: &str, method: &str) -> CallMode {
     match (pkg, method) {
@@ -126,6 +136,25 @@ pub(crate) fn package_mode(pkg: &str, method: &str) -> CallMode {
     }
 }
 
+/// The argument index a package-level call mutates IN PLACE (T22: passing a
+/// `const` root there is a write, `HYB-E3006`). `None` = the descriptor stubs
+/// record no in-place write for this API.
+pub(crate) fn package_mutated_arg(pkg: &str, method: &str) -> Option<usize> {
+    match (pkg, method) {
+        (
+            "sort",
+            "ints" | "strings" | "float64s" | "slice" | "slice_stable" | "sort" | "stable"
+            | "Ints" | "Strings" | "Float64s" | "Slice" | "SliceStable" | "Sort" | "Stable",
+        ) => Some(0),
+        (
+            "io",
+            "read_full" | "read_at_least" | "ReadFull" | "ReadAtLeast",
+        ) => Some(1),
+        ("io", "copy_buffer" | "CopyBuffer") => Some(2),
+        _ => None,
+    }
+}
+
 /// Result shape of a package-level call (for defines / loop variables).
 pub(crate) fn package_result(pkg: &str, method: &str) -> TypeShape {
     match (pkg, method) {
@@ -140,6 +169,10 @@ pub(crate) fn package_result(pkg: &str, method: &str) -> TypeShape {
             TypeShape::Str
         }
         ("strings", "split") | ("strings", "fields") => TypeShape::Slice(Box::new(TypeShape::Str)),
+        // `time.after(d)` returns a receive-only channel (the deadline
+        // pattern, example 04); the element shape is opaque here — the
+        // binding still resolves as a channel so receives on it classify.
+        ("time", "after") => TypeShape::Chan(Box::new(TypeShape::Unknown)),
         ("http", "new_serve_mux") => TypeShape::ForeignOpaque("http.serve_mux".into()),
         ("http", "handler") => TypeShape::ForeignOpaque("http.handler".into()),
         // `atomic.load_pointer` / `atomic.swap_pointer` return an
@@ -147,6 +180,124 @@ pub(crate) fn package_result(pkg: &str, method: &str) -> TypeShape {
         ("atomic", "load_pointer" | "swap_pointer") => TypeShape::Unknown,
         _ if pkg == "atomic" => TypeShape::Primitive,
         _ => TypeShape::Unknown,
+    }
+}
+
+/// Static result count of a foreign package-level call returning multiple
+/// values in Go (`(T, error)`, `(before, after, found)`, etc.) when not
+/// unwrapped with `?` (#380 / T23 `HYB-E2002`).
+pub(crate) fn package_result_count(pkg: &str, method: &str) -> Option<usize> {
+    match (pkg, method) {
+        (
+            "strconv",
+            "parse_int"
+                | "parse_uint"
+                | "parse_float"
+                | "parse_bool"
+                | "parse_complex"
+                | "atoi"
+                | "unquote"
+                | "ParseInt"
+                | "ParseUint"
+                | "ParseFloat"
+                | "ParseBool"
+                | "ParseComplex"
+                | "Atoi"
+                | "Unquote",
+        ) => Some(2),
+        (
+            "os",
+            "open"
+                | "create"
+                | "read_file"
+                | "read_dir"
+                | "getwd"
+                | "user_home_dir"
+                | "user_cache_dir"
+                | "user_config_dir"
+                | "executable"
+                | "lookup_env"
+                | "stat"
+                | "lstat"
+                | "create_temp"
+                | "mkdir_temp"
+                | "Open"
+                | "Create"
+                | "ReadFile"
+                | "ReadDir"
+                | "Getwd"
+                | "UserHomeDir"
+                | "UserCacheDir"
+                | "UserConfigDir"
+                | "Executable"
+                | "LookupEnv"
+                | "Stat"
+                | "Lstat"
+                | "CreateTemp"
+                | "MkdirTemp",
+        ) => Some(2),
+        (
+            "io",
+            "read_all"
+                | "read_full"
+                | "read_at_least"
+                | "copy"
+                | "copy_n"
+                | "copy_buffer"
+                | "write_string"
+                | "ReadAll"
+                | "ReadFull"
+                | "ReadAtLeast"
+                | "Copy"
+                | "CopyN"
+                | "CopyBuffer"
+                | "WriteString",
+        ) => Some(2),
+        (
+            "strings",
+            "cut_prefix" | "cut_suffix" | "CutPrefix" | "CutSuffix",
+        ) => Some(2),
+        ("strings", "cut" | "Cut") => Some(3),
+        (
+            "filepath",
+            "abs"
+                | "rel"
+                | "eval_symlinks"
+                | "glob"
+                | "match"
+                | "split"
+                | "Abs"
+                | "Rel"
+                | "EvalSymlinks"
+                | "Glob"
+                | "Match"
+                | "Split",
+        ) => Some(2),
+        ("path", "match" | "split" | "Match" | "Split") => Some(2),
+        (
+            "time",
+            "parse"
+                | "parse_duration"
+                | "load_location"
+                | "Parse"
+                | "ParseDuration"
+                | "LoadLocation",
+        ) => Some(2),
+        (
+            "net",
+            "listen"
+                | "dial"
+                | "resolve_tcp_addr"
+                | "lookup_host"
+                | "Listen"
+                | "Dial"
+                | "ResolveTCPAddr"
+                | "LookupHost",
+        ) => Some(2),
+        ("net", "split_host_port" | "SplitHostPort") => Some(3),
+        ("hex", "decode_string" | "DecodeString") => Some(2),
+        ("regex", "compile" | "match_string" | "Compile" | "MatchString") => Some(2),
+        _ => None,
     }
 }
 
