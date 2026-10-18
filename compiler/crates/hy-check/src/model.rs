@@ -175,6 +175,13 @@ pub(crate) struct MoveInfo {
     /// Self-describing site description, e.g.
     /// "the move-send `results <- move agg`" or "the consuming call `enc.finish()`".
     pub desc: String,
+    /// The binding whose ownership actually left. Diagnostics name THIS, not
+    /// the binding that happened to notice the use: a may-share peer (a
+    /// reference-typed field or element read out earlier) is not in the
+    /// single-parent `aliases` chain, so resolving the USED binding's root
+    /// named the peer itself and produced a self-alias note for a move of a
+    /// different binding.
+    pub moved_name: String,
 }
 
 /// A live loan. `last` is the inclusive end of the non-lexical window, in
@@ -243,6 +250,16 @@ pub(crate) struct FnState {
     /// rebind time; consumed at the CALL site so an insert inside the body
     /// counts as an A3 event when the call sits in a live slot-loan window.
     pub closure_mutates: HashMap<String, HashSet<String>>,
+    /// Local closure binding -> `(params, named_results, body)` for
+    /// interprocedural return-origin and multi-value return sharing analysis.
+    pub closure_fnlits: HashMap<
+        String,
+        (
+            Vec<(String, Option<hy_syntax::TypeExpr>)>,
+            Vec<(String, Option<hy_syntax::TypeExpr>)>,
+            hy_syntax::Block,
+        ),
+    >,
     /// Declared result shapes of the function being checked (rule N1's
     /// return-site nil checks). Empty for closure bodies (fn literals
     /// carry no result types on the AST surface yet).
