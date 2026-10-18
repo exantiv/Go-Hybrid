@@ -387,6 +387,7 @@ fn check_stmt_own_uses(ck: &mut Checker<'_>, st: &mut FnState, stmt: &Stmt, mana
                                 "closure capture of `{}` (the enclosing scope retains `{}`)",
                                 u.name, u.name
                             ),
+                            moved_name: u.name.clone(),
                         });
                     }
                 }
@@ -1524,6 +1525,7 @@ fn stmt_moves_watched_binding(
                         span: mspan,
                         kind: crate::model::MoveKind::Moved,
                         desc,
+                        moved_name: n.to_string(),
                     });
                 }
             }
@@ -1562,6 +1564,7 @@ fn stmt_moves_watched_binding(
                             span: *span,
                             kind: crate::model::MoveKind::Moved,
                             desc,
+                            moved_name: name.to_string(),
                         });
                     }
                 }

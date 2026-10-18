@@ -175,6 +175,13 @@ pub(crate) struct MoveInfo {
     /// Self-describing site description, e.g.
     /// "the move-send `results <- move agg`" or "the consuming call `enc.finish()`".
     pub desc: String,
+    /// The binding whose ownership actually left. Diagnostics name THIS, not
+    /// the binding that happened to notice the use: a may-share peer (a
+    /// reference-typed field or element read out earlier) is not in the
+    /// single-parent `aliases` chain, so resolving the USED binding's root
+    /// named the peer itself and produced a self-alias note for a move of a
+    /// different binding.
+    pub moved_name: String,
 }
 
 /// A live loan. `last` is the inclusive end of the non-lexical window, in
