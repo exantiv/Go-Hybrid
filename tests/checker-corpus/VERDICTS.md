@@ -783,3 +783,13 @@ Reproduction (checker built from the merged tree, pinned toolchain):
 With all three registrations the corpus is **77 programs: ACCEPT 21 ·
 ACCEPT-MANAGED 2 · REJECT 54** — main's 63 plus these fourteen. Every
 reproduction line above is the merged tree.
+
+## 78-shadowed-unused-import-reject
+
+- Source: PR #535 (filacocta), extracted 2026-10-18.
+- Program: `import "strings"` + `strings := 1` + `fmt.println(strings)` —
+  the only apparent use of the package root is a read of the shadowing local.
+- Verdict: REJECT BUILDABLE (HYB-E1002) — the import is never used; the
+  emitted Go header would fail `imported and not used`.
+- Scope note: LX4 keeps Go lexical scoping — a mention of a shadowed name
+  does not count as package use. Case 47 pins the plain unused form.

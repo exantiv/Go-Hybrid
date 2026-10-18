@@ -79,13 +79,18 @@ class FetchFailureTests(unittest.TestCase):
 
     def test_actions_fetch_empty_artifact_list_is_nonzero(self):
         with tempfile.TemporaryDirectory() as td:
-            with patch.object(JOB, "gh_api", return_value={"total_count": 0, "artifacts": []}):
+            # Hermetic: pin the token gate so the test exercises the
+            # empty-artifact path on any environment (CI has no
+            # token-embedded origin URL; auth rides the extraheader).
+            with patch.object(JOB, "gh_token", return_value="fixture-token"), \
+                    patch.object(JOB, "gh_api", return_value={"total_count": 0, "artifacts": []}):
                 rc = JOB.actions_fetch(123, td)
             self.assertEqual(rc, 1)
 
     def test_actions_fetch_error_payload_is_nonzero(self):
         with tempfile.TemporaryDirectory() as td:
-            with patch.object(JOB, "gh_api", return_value={"message": "Not Found", "status": "404"}):
+            with patch.object(JOB, "gh_token", return_value="fixture-token"), \
+                    patch.object(JOB, "gh_api", return_value={"message": "Not Found", "status": "404"}):
                 rc = JOB.actions_fetch(123, td)
             self.assertEqual(rc, 1)
 

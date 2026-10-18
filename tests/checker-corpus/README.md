@@ -52,3 +52,13 @@ Tripwire rule: more than ~25% of this corpus needing `managed` reopens G0
 (QUESTIONS.md Q1 item 5). Baseline at pre-registration: 11.1%
 verdict-level / 16.7% as-written — definitions and recompute rules in
 VERDICTS.md §Tripwire baseline.
+
+`78-shadowed-unused-import-reject.hy` — filacocta (PR #535): an explicit
+import whose only apparent use names a shadowing local must still reject
+as HYB-E1002 (the emitted Go would carry an unused import). Behavior
+landed on main via the #475/#430 buildable work; the fixture pins the
+surface with author credit (tests extracted to
+`hy-check/tests/import_shadowing_guards.rs`).
+
+With this registration the corpus is **78 programs: ACCEPT 21 ·
+ACCEPT-MANAGED 2 · REJECT 55**.
