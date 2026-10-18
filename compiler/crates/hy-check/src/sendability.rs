@@ -95,7 +95,9 @@ impl<'a> Checker<'a> {
         match &b.shape {
             TypeShape::Unknown => Outcome::Unproven(UnprovenInfo {
                 value: name.to_string(),
-                reason: "its type did not resolve to a sendability class (no ascription and the initializer's type was unresolvable)".to_string(),
+                reason: unproven_atomic_reason(b).unwrap_or_else(|| {
+                    "its type did not resolve to a sendability class (no ascription and the initializer's type was unresolvable)".to_string()
+                }),
             }),
             TypeShape::Closure => Outcome::Rejected(RejectInfo {
                 value: name.to_string(),
@@ -796,7 +798,44 @@ impl<'a> Checker<'a> {
     /// check (the site is ill-typed — no cascade).
     pub(crate) fn check_send_target(&mut self, st: &FnState, chan: &Expr, span: Span) -> bool {
         match self.shape_of_expr(st, chan) {
-            TypeShape::Chan(_) => true,
+            TypeShape::Chan(_) => {
+                if let Some(ty) = self.ty_of_expr(st, chan) {
+                    let resolved = self.resolve_type_alias(&ty);
+                    if matches!(
+                        resolved,
+                        hy_syntax::TypeExpr::Chan {
+                            dir: hy_syntax::ChanDir::Recv,
+                            ..
+                        }
+                    ) {
+                        // HYB-E3008 (chan-direction-mismatch) owns directed-channel
+                        // misuse on main; this generic arm only reports when E3008
+                        // has not already diagnosed the same site, so a defect is
+                        // reported once by its precise code.
+                        if !self
+                            .diags
+                            .iter()
+                            .any(|d| d.code == "HYB-E3008" && d.span == span)
+                        {
+                            let msg = format!(
+                                "cannot send to `{}` (`{}`) — channel is receive-only (HYB-E3007)",
+                                chan.render(),
+                                resolved.render()
+                            );
+                            let notes = vec![
+                                "why: Go rejects `ch <- v` on a `<-chan T` receive-only channel (`invalid operation: cannot send to receive-only channel`), so an accepted Hybrid program would emit unbuildable Go".to_string(),
+                                "fix: declare the parameter or binding as a bidirectional (`chan T`) or send-only (`chan<- T`) channel".to_string(),
+                            ];
+                            self.diags.push(
+                                Diagnostic::error("HYB-E3007", self.path.clone(), span, msg)
+                                    .with_notes(notes),
+                            );
+                        }
+                        return false;
+                    }
+                }
+                true
+            }
             TypeShape::Unknown => {
                 let msg = format!(
                     "cannot prove `{}` is a channel — a send target must resolve to `chan T` (O4.9)",

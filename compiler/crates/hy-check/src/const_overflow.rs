@@ -237,10 +237,67 @@ impl<'a> Checker<'a> {
             );
         }
     }
+
+    /// Check integer constants in variable declarations without an explicit
+    /// type. Go gives these declarations the target's default `int` type.
+    pub(crate) fn check_default_int_overflow(
+        &mut self,
+        name: &str,
+        value: &Expr,
+        st: Option<&FnState>,
+    ) {
+        let (lo, hi) = target_int_range();
+        match const_int_fold_with(value, &self.const_values, 0, st) {
+            ConstFold::NotConst => return,
+            ConstFold::Val(v) if v >= lo && v <= hi => return,
+            ConstFold::Val(_) | ConstFold::TooBig => {}
+        }
+
+        let span = value.span();
+        let msg = format!(
+            "constant expression `{}` overflows default type `int` of `{}` (HYB-E6002)",
+            value.render(),
+            name
+        );
+        let notes = vec![
+            "why: Go assigns default type `int` to an untyped integer constant in a variable declaration and rejects values outside the target int range, so an accepted Hybrid program would emit unbuildable Go (issue #228)"
+                .to_string(),
+            format!(
+                "fix: use a value in [{}, {}], declare an explicit wider type, or keep the value as an untyped constant",
+                lo, hi
+            ),
+        ];
+        self.diags.push(
+            Diagnostic::error("HYB-E6002", self.path.clone(), span, msg).with_notes(notes),
+        );
+    }
 }
 
 fn span_hint(span: Span) -> String {
     format!("{}:{}", span.start.line, span.start.col)
+}
+
+/// Target word size for platform-dependent integer types. Hybrid's current
+/// emitter/runtime targets are 64-bit; keep the policy centralized so a
+/// future target configuration can replace this constant.
+pub(crate) const TARGET_INT_WIDTH_BITS: u32 = 64;
+
+#[inline]
+pub(crate) fn target_int_range() -> (i128, i128) {
+    match TARGET_INT_WIDTH_BITS {
+        32 => (i32::MIN as i128, i32::MAX as i128),
+        64 => (i64::MIN as i128, i64::MAX as i128),
+        _ => (i64::MIN as i128, i64::MAX as i128),
+    }
+}
+
+#[inline]
+pub(crate) fn target_uint_range() -> (i128, i128) {
+    match TARGET_INT_WIDTH_BITS {
+        32 => (0, u32::MAX as i128),
+        64 => (0, u64::MAX as i128),
+        _ => (0, u64::MAX as i128),
+    }
 }
 
 /// Inclusive representable range for a Hybrid fixed-width integer type
@@ -255,10 +312,21 @@ fn fixed_width_int_range(name: &str) -> Option<(i128, i128)> {
         "u16" | "uint16" => (0, u16::MAX as i128),
         "i32" | "int32" | "rune" => (i32::MIN as i128, i32::MAX as i128),
         "u32" | "uint32" => (0, u32::MAX as i128),
-        "i64" | "int64" | "int" | "isize" => (i64::MIN as i128, i64::MAX as i128),
-        "u64" | "uint64" | "uint" | "usize" | "uintptr" => (0, u64::MAX as i128),
+        "i64" | "int64" => (i64::MIN as i128, i64::MAX as i128),
+        "int" | "isize" => target_int_range(),
+        "u64" | "uint64" => (0, u64::MAX as i128),
+        "uint" | "usize" | "uintptr" => target_uint_range(),
         _ => return None,
     })
+}
+
+/// Parsed integer literal, retaining the fact that a syntactically valid
+/// value exceeded i128 instead of treating it as non-constant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConstInt {
+    Value(i128),
+    PosOverflow,
+    NegOverflow,
 }
 
 /// Outcome of folding a constant integer expression (issue #201-B).
@@ -298,9 +366,14 @@ pub(crate) fn const_int_fold_with(
             kind: LitKind::Int(s),
             ..
         } => match parse_int_lit(s) {
-            Some(v) => ConstFold::Val(v),
+            Some(ConstInt::Value(v)) => ConstFold::Val(v),
+            Some(ConstInt::PosOverflow | ConstInt::NegOverflow) => ConstFold::TooBig,
             None => ConstFold::NotConst,
         },
+        Expr::Lit {
+            kind: LitKind::Char(c),
+            ..
+        } => ConstFold::Val(*c as i128),
         Expr::Ident { name, .. } => {
             if let Some(st) = st {
                 if st.env_lookup(name).is_some() {
@@ -469,7 +542,7 @@ fn integer_of_float(f: f64) -> String {
     format!("{}", f.trunc() as i128)
 }
 
-fn parse_int_lit(s: &str) -> Option<i128> {
+fn parse_int_lit(s: &str) -> Option<ConstInt> {
     let clean: String = s.chars().filter(|c| *c != '_').collect();
     if clean.is_empty() {
         return None;
@@ -492,7 +565,14 @@ fn parse_int_lit(s: &str) -> Option<i128> {
     if digits.is_empty() {
         return None;
     }
-    i128::from_str_radix(digits, radix).ok()
+    match i128::from_str_radix(digits, radix) {
+        Ok(v) => Some(ConstInt::Value(v)),
+        Err(err) => match err.kind() {
+            std::num::IntErrorKind::PosOverflow => Some(ConstInt::PosOverflow),
+            std::num::IntErrorKind::NegOverflow => Some(ConstInt::NegOverflow),
+            _ => None,
+        },
+    }
 }
 
 #[cfg(test)]
@@ -510,9 +590,20 @@ mod unit {
 
     #[test]
     fn parse_bases() {
-        assert_eq!(parse_int_lit("300"), Some(300));
-        assert_eq!(parse_int_lit("0x12C"), Some(300));
-        assert_eq!(parse_int_lit("0b101"), Some(5));
-        assert_eq!(parse_int_lit("0o10"), Some(8));
+        assert_eq!(parse_int_lit("300"), Some(ConstInt::Value(300)));
+        assert_eq!(parse_int_lit("0x12C"), Some(ConstInt::Value(300)));
+        assert_eq!(parse_int_lit("0b101"), Some(ConstInt::Value(5)));
+        assert_eq!(parse_int_lit("0o10"), Some(ConstInt::Value(8)));
+        assert_eq!(parse_int_lit("1_000"), Some(ConstInt::Value(1000)));
+    }
+
+    #[test]
+    fn parse_overflow_and_target_ranges() {
+        assert_eq!(
+            parse_int_lit("340282366920938463463374607431768211457"),
+            Some(ConstInt::PosOverflow)
+        );
+        assert_eq!(target_int_range(), (i64::MIN as i128, i64::MAX as i128));
+        assert_eq!(target_uint_range(), (0, u64::MAX as i128));
     }
 }
