@@ -680,6 +680,7 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
                 let vals: Vec<&Expr> = vec![value];
                 let targets = ck.chan_elem_shape(st, chan);
                 ck.check_site(st, *span, "HYB-E3002", &vals, managed, &desc, *is_move, None, targets.as_deref());
+                ck.check_chan_send_const_overflow(st, chan, value);
             }
         }
         Stmt::Select { arms, .. } => {
@@ -715,6 +716,7 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
                             let vals: Vec<&Expr> = vec![value];
                             let targets = ck.chan_elem_shape(st, chan);
                             ck.check_site(st, span, "HYB-E3002", &vals, managed, &desc, *is_move, None, targets.as_deref());
+                            ck.check_chan_send_const_overflow(st, chan, value);
                         }
                     }
                     SelectArmKind::Recv { names, chan } => {
