@@ -28,6 +28,8 @@ Behavior:
     "hard": true. A hard setup failure skips all commands and still writes a summary.
   * "cwd": "repo" means relative to the cloned repo checkout.
   * Output files land in the results dir (default: $RESULTS_DIR or ./results).
+  * Declared expected_results must be files. A results/ prefix refers to the
+    selected results dir, including when --results-dir overrides the default.
   * Never panics; all errors become entries in summary.json.
 Stdlib only — must run on a bare Kaggle/Actions image with just python3.
 """
@@ -89,7 +91,13 @@ def env_report():
     rep["cgroup_mem"] = cap("cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null")
     rep["cgroup_cpu"] = cap("cat /sys/fs/cgroup/cpu.max 2>/dev/null || cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us 2>/dev/null")
     for tool in ("go", "rustc", "cargo", "gcc", "clang", "git", "cc"):
-        rep["tool_" + tool] = cap("{} --version 2>/dev/null | head -1".format(tool))
+        # Go uses `version`, not `--version`. Avoid a pipe to head, whose
+        # successful exit would hide a missing or failing tool's exit status.
+        code, _, out = run_cmd([tool, "version" if tool == "go" else "--version"], 10)
+        version = out.splitlines()[0].strip() if out.splitlines() else ""
+        if code != 0 or not version or (tool == "go" and not version.startswith("go version ")):
+            version = "n/a"
+        rep["tool_" + tool] = version
     rep["kaggle_env"] = redact({k: v for k, v in os.environ.items() if k.startswith("KAGGLE_")})
     rep["ci_env"] = redact({k: v for k, v in os.environ.items() if k.startswith(("GITHUB_", "RUNNER_", "CI"))})
     return rep
@@ -150,10 +158,13 @@ def main():
 
     # sanity: verify we are at the pinned SHA when a repo checkout exists
     sha_ok = True
-    if os.path.isdir(os.path.join(repo_dir, ".git")):
+    unverifiable_pin = False
+    want = job.get("sha")
+    # Linked worktrees and submodules use a .git file, not a directory.
+    # Even a broken metadata link must enter the fail-closed SHA check.
+    if os.path.lexists(os.path.join(repo_dir, ".git")):
         code, _, out = run_cmd(["git", "rev-parse", "HEAD"], 10, cwd=repo_dir)
         at = out.strip()
-        want = job.get("sha")
         if code != 0:
             sha_ok = False
             record("sha-check", "check", 1, 0.0, "failed to resolve HEAD: {}".format(out.strip()))
@@ -165,10 +176,29 @@ def main():
             record("sha-check", "check", 1, 0.0, "repo at {} but job pins {}".format(at, want))
         else:
             record("sha-check", "check", 0, 0.0, "at {}".format(at))
+    elif want not in (None, "HEAD", ""):
+        # A pinned job against a checkout with no .git (e.g. the Kaggle worker's
+        # codeload-tarball fallback): there is nothing to verify the pin against,
+        # so the job must not run or report ok. Reporting green here would make
+        # summary.json evidence for a commit that was never checked out.
+        sha_ok = False
+        unverifiable_pin = True
+        record(
+            "sha-check",
+            "check",
+            1,
+            0.0,
+            "no .git in {}; cannot verify pinned sha {}".format(repo_dir, str(want)[:12]),
+        )
 
     hard_setup_failed = False
     if not sha_ok:
-        print("[{}] check sha-check: failed, skipping setup and commands".format(UTC()), flush=True)
+        print(
+            "[{}] check sha-check: failed ({}), skipping setup and commands".format(
+                UTC(), "pin unverifiable" if unverifiable_pin else "commit mismatch"
+            ),
+            flush=True,
+        )
     else:
         for step in job.get("setup", []):
             cwd = repo_dir if step.get("cwd") == "repo" else (step.get("cwd") or None)
@@ -186,11 +216,31 @@ def main():
         if code != 0 and step.get("hard"):
             break
 
+    path = os.path.join(results_dir, "summary.json")
+    expected_results = job.get("expected_results", [])
+    if not isinstance(expected_results, list):
+        record("expected-result", "check", 1, 0.0,
+               "expected_results must be a list of file paths")
+        expected_results = []
+    for expected in expected_results:
+        if not isinstance(expected, str) or not expected:
+            record("expected-result", "check", 1, 0.0,
+                   "expected result must be a non-empty file path")
+            continue
+        # Job specs use results/... independent of the worker's output root.
+        target = (os.path.join(results_dir, expected[len("results/"):])
+                  if expected.startswith("results/") else expected)
+        # This file is generated below, after the final verdict is known.
+        if os.path.abspath(target) == os.path.abspath(path):
+            continue
+        if not os.path.isfile(target):
+            record("expected-result", "check", 1, 0.0,
+                   "missing expected result file: {}".format(expected))
+
     summary["wall_clock_s"] = round(time.monotonic() - t0, 2)
     summary["ok"] = all(s["exit"] == 0 for s in summary["steps"])
     summary["finished"] = UTC()
 
-    path = os.path.join(results_dir, "summary.json")
     with open(path, "w") as f:
         json.dump(summary, f, indent=2)
     print("\n=== summary.json written to {} (ok={}) ===".format(path, summary["ok"]), flush=True)

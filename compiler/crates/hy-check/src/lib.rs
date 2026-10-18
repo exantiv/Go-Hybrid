@@ -104,6 +104,7 @@ pub fn check_file(file: &File) -> CheckResult {
 
     build_tables(&mut ck);
     ck.check_struct_decls(); // A6: borrow-handle / pointer struct fields
+    ck.check_file_const_zero_divisors(); // Issue #149/#508: constant zero divisor in file consts
 
     // Issue #228 family A: value-position names nothing declares must be
     // HYB-E1001 here, not `undefined: X` at go build. Const initializers and
@@ -177,11 +178,12 @@ fn build_tables(ck: &mut Checker<'_>) {
                 // Issue #148: a file-level `const n int8 = 300` must not
                 // pass the checker and then fail `go build` (overflow).
                 if let Some(ty) = &c.ty {
-                    ck.check_const_overflow_init(&c.name, ty, &c.value);
+                    ck.check_const_overflow_init(&c.name, ty, &c.value, None);
                 }
                 ck.declare_pkg_name(&c.name, "const", c.span);
                 let b = ck.const_binding(c);
                 ck.consts.insert(c.name.clone(), b);
+                ck.const_values.insert(c.name.clone(), &c.value);
                 // Issue #205: file-level `const c = get_val()` must not pass check then fail go build.
                 // Placed after insert so this hook sits below main's E6002 overflow check and
                 // 3-way-merges cleanly (same pattern as PR #191 relocated hooks).
@@ -392,6 +394,7 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
             }
         }
         st.result_shapes.push(shape);
+        st.result_types.push(r.ty.clone());
     }
 
     // Pass A: indices, structural extents, last-use map.
@@ -690,6 +693,7 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
                         None,
                         targets.as_deref(),
                     );
+                    ck.check_chan_send_const_overflow(&st, chan, value);
                 }
             }
 
@@ -805,6 +809,7 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
                                     None,
                                     targets.as_deref(),
                                 );
+                                ck.check_chan_send_const_overflow(&st, chan, value);
                             }
                         }
                         SelectArmKind::Recv { chan, .. } => {
@@ -3980,6 +3985,93 @@ mod tests {
              }",
         );
         assert_eq!(r_pkg_ok.verdict, Verdict::Accept, "{:?}", r_pkg_ok.diagnostics);
+    }
+
+    #[test]
+    fn e3001_e3002_fixits_name_managed_reason_and_category_syntax() {
+        // Track #7 wording sweep: HYB-E3001 and HYB-E3002 fix-its must name the
+        // required `managed("why this bypass is safe", "category") { ... }` form
+        // and the closed category list (matching HYB-E3005 after PR #11) so
+        // following the fix-it does not hit HYB-E0003.
+        let r_spawn = check(
+            "fn worker(m map[string]int) { m[\"k\"] = 1 }\n\
+             fn main() {\n\
+               m := map[string]int{\"k\": 0}\n\
+               task worker(m)\n\
+             }",
+        );
+        let e3001 = r_spawn
+            .diagnostics
+            .iter()
+            .find(|d| d.code == "HYB-E3001")
+            .expect("HYB-E3001 at spawn");
+        assert!(
+            e3001.fixits.iter().any(|f| {
+                f.description
+                    .contains("managed(\"why this bypass is safe\", \"category\")")
+                    && f.description
+                        .contains("mutex, atomic, actor, finalizer, interop, other")
+            }),
+            "HYB-E3001 fixits must name managed(reason, category) and category set: {:?}",
+            e3001.fixits
+        );
+
+        let r_send = check(
+            "fn main() {\n\
+               ch := make(chan map[string]int, 1)\n\
+               m := map[string]int{\"k\": 0}\n\
+               ch <- m\n\
+             }",
+        );
+        let e3002 = r_send
+            .diagnostics
+            .iter()
+            .find(|d| d.code == "HYB-E3002")
+            .expect("HYB-E3002 at send");
+        assert!(
+            e3002.fixits.iter().any(|f| {
+                f.description
+                    .contains("managed(\"why this bypass is safe\", \"category\")")
+                    && f.description
+                        .contains("mutex, atomic, actor, finalizer, interop, other")
+            }),
+            "HYB-E3002 fixits must name managed(reason, category) and category set: {:?}",
+            e3002.fixits
+        );
+    }
+
+    #[test]
+    fn move_of_unproven_atomic_cites_guarantees_row_11_not_missing_ascription() {
+        // Track #7 wording sweep: `classify_ident` and `classify_addr_of`
+        // consulted `unproven_atomic_reason(b)`, but `classify_move_ident` did
+        // not — so `task worker(move p)` on an explicitly ascribed
+        // `var p atomic.pointer[int]` falsely claimed "no ascription" instead
+        // of explaining GUARANTEES.md row 11.
+        let r = check(
+            "fn worker(p atomic.pointer[int]) {}\n\
+             fn main() {\n\
+               var p atomic.pointer[int]\n\
+               task worker(move p)\n\
+             }",
+        );
+        let e3005 = r
+            .diagnostics
+            .iter()
+            .find(|d| d.code == "HYB-E3005")
+            .expect("HYB-E3005 on move of non-scalar atomic");
+        assert!(
+            e3005
+                .notes
+                .iter()
+                .any(|n| n.contains("GUARANTEES.md row 11") && n.contains("atomic.pointer[int]")),
+            "move of non-scalar atomic must cite GUARANTEES.md row 11: {:?}",
+            e3005.notes
+        );
+        assert!(
+            !e3005.notes.iter().any(|n| n.contains("no ascription")),
+            "must not claim 'no ascription' when `var p atomic.pointer[int]` is ascribed: {:?}",
+            e3005.notes
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -175,6 +175,13 @@ pub(crate) struct MoveInfo {
     /// Self-describing site description, e.g.
     /// "the move-send `results <- move agg`" or "the consuming call `enc.finish()`".
     pub desc: String,
+    /// The binding whose ownership actually left. Diagnostics name THIS, not
+    /// the binding that happened to notice the use: a may-share peer (a
+    /// reference-typed field or element read out earlier) is not in the
+    /// single-parent `aliases` chain, so resolving the USED binding's root
+    /// named the peer itself and produced a self-alias note for a move of a
+    /// different binding.
+    pub moved_name: String,
 }
 
 /// A live loan. `last` is the inclusive end of the non-lexical window, in
@@ -243,10 +250,22 @@ pub(crate) struct FnState {
     /// rebind time; consumed at the CALL site so an insert inside the body
     /// counts as an A3 event when the call sits in a live slot-loan window.
     pub closure_mutates: HashMap<String, HashSet<String>>,
+    /// Local closure binding -> `(params, named_results, body)` for
+    /// interprocedural return-origin and multi-value return sharing analysis.
+    pub closure_fnlits: HashMap<
+        String,
+        (
+            Vec<(String, Option<hy_syntax::TypeExpr>)>,
+            Vec<(String, Option<hy_syntax::TypeExpr>)>,
+            hy_syntax::Block,
+        ),
+    >,
     /// Declared result shapes of the function being checked (rule N1's
     /// return-site nil checks). Empty for closure bodies (fn literals
     /// carry no result types on the AST surface yet).
     pub result_shapes: Vec<TypeShape>,
+    /// Declared result types of the function being checked (for constant overflow checks).
+    pub result_types: Vec<hy_syntax::TypeExpr>,
     /// Declared named result bindings (`fn f() (out map[string]int)`), in
     /// signature order. A bare `return` reads and returns each named result.
     pub named_results: Vec<String>,
@@ -254,6 +273,10 @@ pub(crate) struct FnState {
     /// composite literal containing `&...`), for O2 `LOAN-ESCAPE` on
     /// named-result / variable returns (`out = &x; return` / `return out`).
     pub borrow_bindings: HashSet<String>,
+    /// Local closure bindings -> `(params, results, body)` recorded at define/rebind
+    /// time so call sites can analyze parameter/capture stores (`record_callee_param_stores`).
+    pub closure_defs:
+        HashMap<String, (Vec<hy_syntax::Param>, Vec<hy_syntax::FnResult>, hy_syntax::Block)>,
 }
 
 impl FnState {
@@ -668,6 +691,10 @@ pub(crate) struct Checker<'a> {
     pub method_decls: HashMap<(String, String), &'a FnDecl>,
     /// file-level consts (immutable, visible in every fn).
     pub consts: HashMap<String, Binding>,
+    /// File-level const literal values, for constant-folding identifier
+    /// references (`const big = 300; var n int8 = big` must be rejected
+    /// like the literal).
+    pub const_values: HashMap<String, &'a Expr>,
     /// Known foreign package prefixes (imports ∪ the builtin table).
     pub packages: HashSet<String>,
     /// Package-scope names (issue #201-C): top-level fns / consts / structs
@@ -712,6 +739,7 @@ impl<'a> Checker<'a> {
             fns: HashMap::new(),
             method_decls: HashMap::new(),
             consts: HashMap::new(),
+            const_values: HashMap::new(),
             packages: HashSet::new(),
             pkg_names: HashMap::new(),
             methods: HashSet::new(),
