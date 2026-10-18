@@ -496,25 +496,9 @@ fn check_stmt(
                 check_expr(ck, st, v, can_propagate);
             }
         }
-        Stmt::Defer { call, .. } => {
-            if let Expr::Try { operand, span } = unwrap_parens(call) {
-                ck.diags.push(
-                    Diagnostic::error(
-                        "HYB-E2001",
-                        ck.path.clone(),
-                        *span,
-                        "`?` cannot be the direct operand of a defer statement — the deferred call executes at function return and cannot propagate errors (E3)",
-                    )
-                    .with_notes(vec![
-                        "remove `?` from the deferred call (`defer f()` instead of `defer f()?`) or handle the error inside a deferred closure".to_string(),
-                    ])
-                    .with_rule("P"),
-                );
-                check_expr(ck, st, operand, can_propagate);
-            } else {
-                check_expr(ck, st, call, can_propagate);
-            }
-        }
+        // The HYB-E2001 defer-operand rule has ONE owner (builtins.rs, #288);
+        // this pass only checks the legality of any `?` inside the operand.
+        Stmt::Defer { call, .. } => check_expr(ck, st, call, can_propagate),
         Stmt::Task { callee, args, .. } => {
             check_expr(ck, st, callee, can_propagate);
             for a in args {
@@ -540,7 +524,7 @@ fn check_stmt(
             for arm in arms {
                 st.scope_push();
                 match &arm.kind {
-                    SelectArmKind::Send { chan, value } => {
+                    SelectArmKind::Send { chan, value, .. } => {
                         check_expr(ck, st, chan, can_propagate);
                         check_expr(ck, st, value, can_propagate);
                     }

@@ -232,7 +232,7 @@ impl<'a> Scan<'a> {
             Stmt::Select { arms, .. } => {
                 for arm in arms {
                     match &arm.kind {
-                        SelectArmKind::Send { chan, value } => {
+                        SelectArmKind::Send { chan, value, .. } => {
                             self.run_expr(chan);
                             self.run_expr(value);
                         }

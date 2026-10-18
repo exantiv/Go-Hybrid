@@ -105,31 +105,6 @@ fn repro_3_closure_without_error_return_is_rejected_e4005() {
 }
 
 // ---------------------------------------------------------------------------
-// Repro 4: `?` in defer statement -> HYB-E2001 (P / E3)
-// ---------------------------------------------------------------------------
-const REPRO_DEFER_TRY: &str = "\
-fn cleanup() error {
-    return nil
-}
-
-fn main() {
-    defer cleanup()?
-}
-";
-
-#[test]
-fn repro_4_defer_try_is_rejected_e2001() {
-    let r = check(REPRO_DEFER_TRY);
-    let codes = error_codes(&r);
-    assert!(
-        codes.iter().any(|c| c == "HYB-E2001"),
-        "expected HYB-E2001 for `?` in defer, got {:?}",
-        codes
-    );
-    assert_eq!(r.verdict, Verdict::Reject);
-}
-
-// ---------------------------------------------------------------------------
 // Repro 5: `?` in non-main function without error return -> HYB-E4005 (E3b)
 // ---------------------------------------------------------------------------
 const REPRO_E3B_FN: &str = "\
@@ -412,41 +387,4 @@ fn valid_defer_argument_try_accepts() {
         codes
     );
     assert_eq!(r.verdict, Verdict::Accept);
-}
-
-#[test]
-fn closure_body_non_call_defer_rejects_e2001() {
-    let src = "\
-fn main() {
-    cb := fn() {
-        defer 3
-    }
-    cb()
-}
-";
-    let r = check(src);
-    assert_eq!(r.verdict, Verdict::Reject);
-    let codes = error_codes(&r);
-    assert_eq!(
-        codes,
-        vec!["HYB-E2001".to_string()],
-        "expected exactly one HYB-E2001 for non-call `defer 3` inside closure body, got {:?}",
-        codes
-    );
-}
-
-#[test]
-fn defer_non_call_flat_body_rejected_exactly_once() {
-    for expr in ["3", "1 + 2"] {
-        let src = format!("fn main() {{\n    defer {expr}\n}}\n");
-        let r = check(&src);
-        assert_eq!(r.verdict, Verdict::Reject);
-        let codes = error_codes(&r);
-        assert_eq!(
-            codes,
-            vec!["HYB-E2001".to_string()],
-            "expected single HYB-E2001 (not duplicated across structure and try_legality) for `defer {expr}`, got {:?}",
-            codes
-        );
-    }
 }

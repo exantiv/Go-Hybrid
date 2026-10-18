@@ -90,7 +90,7 @@ impl<'a> Checker<'a> {
             Stmt::Select { arms, .. } => {
                 for arm in arms {
                     match &arm.kind {
-                        SelectArmKind::Send { chan, value } => {
+                        SelectArmKind::Send { chan, value, .. } => {
                             self.check_expr_recv_operands(st, chan);
                             self.check_expr_recv_operands(st, value);
                         }

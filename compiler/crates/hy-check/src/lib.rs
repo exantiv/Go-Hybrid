@@ -706,8 +706,12 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
                     let shapes = ck.iterate_var_shapes(&st, expr, vars.len());
                     for (name, shape) in vars.iter().zip(shapes) {
                         let is_ref = shape.is_reference_alias();
+                        let may_share = ck.shape_may_share(&shape);
                         ck.define_binding(&mut st, name, shape, None, false, managed);
                         if !is_chan {
+                            if may_share {
+                                ck.record_may_share(&mut st, name, expr);
+                            }
                             if is_ref {
                                 if let Some(root) = expr.root_ident() {
                                     if ck.lookup_binding(&st, root).is_some() {
@@ -754,7 +758,12 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
             Stmt::Select { arms, .. } => {
                 for arm in arms {
                     match &arm.kind {
-                        SelectArmKind::Send { chan, value } => {
+                        SelectArmKind::Send {
+                            chan,
+                            value,
+                            is_move,
+                            ..
+                        } => {
                             ck.mark_move_in_value(
                                 &mut st,
                                 chan,
@@ -762,11 +771,28 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
                             );
                             let span = chan.span().to(value.span());
                             if ck.check_send_target(&st, chan, span) {
-                                let desc = format!(
-                                    "the select-send `{} <- {}`",
-                                    chan.render(),
-                                    value.render()
-                                );
+                                // C5: a select send clause is a sendability
+                                // check-site "exactly like statement sends", so
+                                // the class-3 owned-move route (`ch <- move v`)
+                                // must be available here too. The is_move marker
+                                // the send-statement parser produced used to be
+                                // dropped when the statement became a select
+                                // arm: the move was invisible to the checker, so
+                                // a legal owned move-send rejected as A1c and the
+                                // sender's later use was never frozen (O5.2).
+                                let desc = if *is_move {
+                                    format!(
+                                        "the move-send `{} <- move {}`",
+                                        chan.render(),
+                                        value.render()
+                                    )
+                                } else {
+                                    format!(
+                                        "the select-send `{} <- {}`",
+                                        chan.render(),
+                                        value.render()
+                                    )
+                                };
                                 let vals: Vec<&Expr> = vec![value];
                                 let targets = ck.chan_elem_shape(&st, chan);
                                 ck.check_site(
@@ -776,7 +802,7 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
                                     &vals,
                                     managed,
                                     &desc,
-                                    false,
+                                    *is_move,
                                     None,
                                     targets.as_deref(),
                                 );
@@ -3235,6 +3261,95 @@ mod tests {
              }",
         );
         assert_eq!(r.verdict, Verdict::Accept, "{:?}", r.diagnostics);
+    }
+
+    /// C5: a select send clause (`ch <- v:`) is a sendability check-site
+    /// "exactly like statement sends", so the class-3 owned-move route
+    /// (`ch <- move v`) must work there too.
+    ///
+    /// The parser's `is_move` marker was dropped when a send statement was
+    /// converted into a select arm (`SelectArmKind::Send` carried no flag),
+    /// and both check sites passed a hardcoded `false` as `implicit_move`.
+    /// Consequences: `select { out <- move m: {} }` was rejected A1c
+    /// (HYB-E3002) even though the statement-send twin `out <- move m` was
+    /// accepted, and — the half that matters for the guarantee — the move
+    /// was never recorded, so the O5.2 freeze on `m` never began and the
+    /// sender could keep writing the value it had just handed away.
+    #[test]
+    fn select_send_move_marker_is_honored_and_freezes_the_source() {
+        // 1. The repro: a legal owned move-send inside a select arm.
+        let r = check(
+            "fn main() {\n\
+               m := map[string]int{\"k\": 0}\n\
+               out := make(chan map[string]int, 1)\n\
+               select {\n\
+                 out <- move m: {}\n\
+               }\n\
+               fmt.println(\"sent\")\n\
+             }",
+        );
+        assert_eq!(r.verdict, Verdict::Accept, "{:?}", r.diagnostics);
+        assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+
+        // 2. Statement-send control: the same route already worked there.
+        let r_stmt = check(
+            "fn main() {\n\
+               m := map[string]int{\"k\": 0}\n\
+               out := make(chan map[string]int, 1)\n\
+               out <- move m\n\
+               fmt.println(\"sent\")\n\
+             }",
+        );
+        assert_eq!(r_stmt.verdict, Verdict::Accept, "{:?}", r_stmt.diagnostics);
+
+        // 3. Negative control: WITHOUT `move` the same arm still rejects.
+        //    The fix must not widen the sendability rule.
+        let r_plain = check(
+            "fn main() {\n\
+               m := map[string]int{\"k\": 0}\n\
+               out := make(chan map[string]int, 1)\n\
+               select {\n\
+                 out <- m: {}\n\
+               }\n\
+             }",
+        );
+        assert_eq!(r_plain.verdict, Verdict::Reject, "{:?}", r_plain.diagnostics);
+        assert!(r_plain.diagnostics.iter().any(|d| d.code == "HYB-E3002"));
+
+        // 4. The freeze now begins at the select-send: the sender's later
+        //    write is A1b / HYB-E3003, exactly as after a statement send.
+        let r_freeze = check(
+            "fn main() {\n\
+               m := map[string]int{\"k\": 0}\n\
+               out := make(chan map[string]int, 1)\n\
+               select {\n\
+                 out <- move m: {}\n\
+               }\n\
+               m[\"k\"] = 1\n\
+             }",
+        );
+        assert_eq!(r_freeze.verdict, Verdict::Reject, "{:?}", r_freeze.diagnostics);
+        assert_eq!(first_error_rule(&r_freeze).as_deref(), Some("A1b"));
+        assert!(r_freeze.diagnostics.iter().any(|d| d.code == "HYB-E3003"));
+
+        // 5. The non-ident form keeps its own rule: `move h.m` in a select
+        //    arm is O5.4 / HYB-E3004, same as the statement-send spelling.
+        let r_field = check(
+            "struct holder { m map[string]int }\n\
+             fn main() {\n\
+               h := holder{m: map[string]int{\"k\": 0}}\n\
+               out := make(chan map[string]int, 1)\n\
+               select {\n\
+                 out <- move h.m: {}\n\
+               }\n\
+             }",
+        );
+        assert_eq!(r_field.verdict, Verdict::Reject, "{:?}", r_field.diagnostics);
+        assert!(
+            r_field.diagnostics.iter().any(|d| d.code == "HYB-E3004"),
+            "{:?}",
+            r_field.diagnostics
+        );
     }
 
     #[test]
