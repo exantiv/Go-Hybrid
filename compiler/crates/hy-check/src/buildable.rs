@@ -101,19 +101,25 @@ impl OpKind {
     }
 }
 
-/// One function-local binding that Go requires to be read.
+/// One function-local binding that Go requires to be read: `:=`/`let`
+/// (checked since #185), `var`/`const` (PR #475), and the elidable
+/// `for`/`select` bindings (PR #536 — only diagnosed when written).
+/// Tracked for both reads and writes.
 struct Define {
     name: String,
     span: Span,
     kind: LocalKind,
     used: bool,
+    written: bool,
+    elidable: bool,
 }
 
 struct Collector<'a> {
     ck: &'a Checker<'a>,
-    /// One layer per open block/closure. `Some(id)` = a checked `:=`/`let`
-    /// define; `None` = a name that shadows (params, receivers, `var`,
-    /// `for`/select/match bindings) but is outside the issue's scope.
+    /// One layer per open block/closure. `Some(id)` = a checked define
+    /// (`:=`/`let`/`var`/`const`, or a written elidable `for`/`select`
+    /// binding); `None` = a name that shadows (params, receivers, named
+    /// results, untouched `for`/select/match bindings) outside the read rule.
     scopes: Vec<HashMap<String, Option<usize>>>,
     /// Parallel lexical scope stack tracking resolved operand kinds (#425).
     kind_scopes: Vec<HashMap<String, OpKind>>,
@@ -221,22 +227,92 @@ impl<'a> Collector<'a> {
         self.file_consts.get(name).cloned()
     }
 
-    /// Every identifier mention feeds the import-usage set.
+    /// A `for`-iterate or `select`-receive binding is elided to `_` at
+    /// emission when completely untouched, but if the body assigns to it
+    /// (`v = ...`) without ever reading it, the emitter must keep the binding
+    /// and Go rejects it as `declared and not used`.
+    fn define_elidable(&mut self, name: &str, span: Span) {
+        if name == "_" {
+            return;
+        }
+        let Some(top) = self.scopes.last_mut() else {
+            return;
+        };
+        if top.contains_key(name) {
+            return;
+        }
+        let id = self.defines.len();
+        self.defines.push(Define {
+            name: name.to_string(),
+            span,
+            kind: LocalKind::Define,
+            used: false,
+            written: false,
+            elidable: true,
+        });
+        top.insert(name.to_string(), Some(id));
+    }
+
+    /// Every identifier mention not shadowed by a local or parameter binding
+    /// feeds the import-usage set.
     fn mention(&mut self, name: &str) {
-        self.roots.insert(name.to_string());
+        if !self
+            .scopes
+            .iter()
+            .rev()
+            .any(|layer| layer.contains_key(name))
+        {
+            self.roots.insert(name.to_string());
+        }
     }
 
     /// A read of `name`: marks the innermost checked define it resolves to.
     /// A read inside a closure resolves through the closure's scope layers
     /// to the captured outer define — exactly what Go's check counts.
     fn read(&mut self, name: &str) {
-        self.mention(name);
         for layer in self.scopes.iter().rev() {
             if let Some(entry) = layer.get(name) {
                 if let Some(id) = entry {
                     self.defines[*id].used = true;
                 }
                 return;
+            }
+        }
+        self.mention(name);
+    }
+
+    fn write(&mut self, name: &str) {
+        for layer in self.scopes.iter().rev() {
+            if let Some(entry) = layer.get(name) {
+                if let Some(id) = entry {
+                    self.defines[*id].written = true;
+                }
+                return;
+            }
+        }
+        self.mention(name);
+    }
+
+    fn check_repeated_bindings(&mut self, names: &[String], span: Span) {
+        let mut seen: HashSet<&str> = HashSet::new();
+        for name in names {
+            if name != "_" && !seen.insert(name.as_str()) {
+                self.diags.push(
+                    Diagnostic::error(
+                        "HYB-E1002",
+                        self.path.clone(),
+                        span,
+                        format!(
+                            "`{}` is repeated on the left of one `:=` — Go refuses `{} := ...` (repeated on left side of :=) (HYB-E1002)",
+                            name,
+                            names.join(", ")
+                        ),
+                    )
+                    .with_notes(vec![
+                        "each left-hand name must appear once; write `x, y := 1, 2`"
+                            .to_string(),
+                    ]),
+                );
             }
         }
     }
@@ -272,6 +348,11 @@ impl<'a> Collector<'a> {
                 self.bind_kind(rname, rk);
             }
         }
+        for r in &f.results {
+            if let Some(name) = &r.name {
+                self.exempt(name);
+            }
+        }
         self.block_stmts(body);
         self.pop_scope();
     }
@@ -287,27 +368,7 @@ impl<'a> Collector<'a> {
         );
         if short_define {
             // Form 3: `x, x := 1, 2` — `x repeated on left side of :=`.
-            let mut seen: HashSet<&str> = HashSet::new();
-            for name in &l.names {
-                if name != "_" && !seen.insert(name.as_str()) {
-                    self.diags.push(
-                        Diagnostic::error(
-                            "HYB-E1002",
-                            self.path.clone(),
-                            l.span,
-                            format!(
-                                "`{}` is repeated on the left of one `:=` — Go refuses `{} := ...` (repeated on left side of :=) (HYB-E1002)",
-                                name,
-                                l.names.join(", ")
-                            ),
-                        )
-                        .with_notes(vec![
-                            "each left-hand name must appear once; write `x, y := 1, 2`"
-                                .to_string(),
-                        ]),
-                    );
-                }
-            }
+            self.check_repeated_bindings(&l.names, l.span);
             // Form 1 (the `_` half): `:=` needs at least one NEW variable.
             // `_ := 5`, `_, _ := ...` and a same-scope re-define declare
             // none — Go's `no new variables on left side of :=`.
@@ -370,6 +431,8 @@ impl<'a> Collector<'a> {
                 span: l.span,
                 kind: l.kind,
                 used: false,
+                written: false,
+                elidable: false,
             });
             top.insert(name.clone(), Some(id));
         }
@@ -468,7 +531,9 @@ impl<'a> Collector<'a> {
                 }
                 self.pop_scope();
             }
-            Stmt::For { kind, body, .. } => {
+            Stmt::For {
+                kind, body, span, ..
+            } => {
                 self.push_scope();
                 match kind {
                     ForKind::While { cond } => {
@@ -483,12 +548,14 @@ impl<'a> Collector<'a> {
                         self.bind_kind(var, OpKind::Int);
                     }
                     ForKind::Iterate { vars, expr } => {
+                        self.check_repeated_bindings(vars, *span);
                         self.expr(expr);
                         let iter_kinds = self.iterate_var_kinds(expr, vars.len());
                         // Unread iterate bindings are lowered to `_` at
-                        // emission (issue #139) — outside this pass.
+                        // emission (issue #139); write-only ones still
+                        // reject as unused (PR #536).
                         for (v, k) in vars.iter().zip(iter_kinds) {
-                            self.exempt(v);
+                            self.define_elidable(v, *span);
                             self.bind_kind(v, k);
                         }
                     }
@@ -518,7 +585,7 @@ impl<'a> Collector<'a> {
                             self.mention(root);
                         }
                         if let Some(b) = binding {
-                            self.exempt(b);
+                            self.define_elidable(b, subject.span());
                             self.bind_kind(b, OpKind::Unknown);
                         }
                     }
@@ -542,15 +609,14 @@ impl<'a> Collector<'a> {
                             self.expr(value);
                         }
                         SelectArmKind::Recv { names, chan } => {
+                            self.check_repeated_bindings(names, chan.span());
                             self.expr(chan);
                             let elem = match self.kind_of_expr(chan) {
                                 OpKind::Chan(e) => *e,
                                 _ => OpKind::Unknown,
                             };
-                            // Go does check select-receive names; outside
-                            // the issue's three forms (documented).
                             for (i, n) in names.iter().enumerate() {
-                                self.exempt(n);
+                                self.define_elidable(n, chan.span());
                                 self.bind_kind(n, if i == 0 { elem.clone() } else { OpKind::Bool });
                             }
                         }
@@ -593,7 +659,7 @@ impl<'a> Collector<'a> {
                 // count as a read; `x++`, `x += 1` and every non-ident
                 // target (`x[k] = v`, `x.f = v`, `&x`) read the root.
                 if matches!(op, AssignOp::Assign) {
-                    self.mention(n);
+                    self.write(n);
                 } else {
                     self.read(n);
                 }
@@ -733,6 +799,11 @@ impl<'a> Collector<'a> {
                         self.exempt(rname);
                         let rk = self.kind_of_ty(&r.ty, 0);
                         self.bind_kind(rname, rk);
+                    }
+                }
+                for r in results {
+                    if let Some(name) = &r.name {
+                        self.exempt(name);
                     }
                 }
                 self.block_stmts(body);
@@ -1756,7 +1827,7 @@ impl<'a> Collector<'a> {
     /// All fn-local declarations have the same Go unused-binding rule.
     fn finish(&mut self) {
         for d in &self.defines {
-            if !d.used {
+            if !d.used && (!d.elidable || d.written) {
                 let emitted = match d.kind {
                     LocalKind::Define | LocalKind::Let => format!("{} := ...", d.name),
                     LocalKind::Var | LocalKind::Const => format!("var {}", d.name),
