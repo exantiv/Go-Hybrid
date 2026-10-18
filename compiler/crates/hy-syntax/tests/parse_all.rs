@@ -6,8 +6,8 @@
 //!   * spikes/spike6-ownership/work/*.hy    (10 programs — Tier-0 rewrites)
 //!   * examples/01,02,03/program.hy         (MVP-0 target programs)
 //!
-//! plus the stretch examples 04â€“10 (same surface as the spikes; must parse
-//! or fail cleanly â€” here we assert they parse too).
+//! plus the stretch examples 04–10 (same surface as the spikes; must parse
+//! or fail cleanly — here we assert they parse too).
 
 use hy_syntax::parse_file;
 use std::path::PathBuf;
@@ -49,7 +49,7 @@ fn must_parse(path: &PathBuf) {
 #[test]
 fn checker_corpus_all_parse() {
     let files = hy_files_under("tests/checker-corpus");
-    assert_eq!(files.len(), 61, "expected exactly 61 corpus programs",);
+    assert_eq!(files.len(), 63, "expected exactly 63 corpus programs",);
     // 61-string-escape-fail-closed.hy is the corpus's first PARSE-reject
     // fixture (a malformed LX7 string escape must be named by the lexer,
     // never silently accepted): it is excluded from the must-parse loop
