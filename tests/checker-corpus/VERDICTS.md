@@ -644,3 +644,49 @@ so `move h` froze `h` but not `shared` and the emitted Go raced.
 | 58 | 58-defer-live-reference-via-alias | REJECT | A1b | `HYB-E3003` | the deferred call names the ALIAS, the move transfers the ORIGIN |
 | 59 | 59-rebind-forgets-defer-capture | REJECT | A1b | `HYB-E3003` | rebinding the name must not forget the captured storage |
 | 60 | 60-rebind-without-defer-control | ACCEPT | — | — | the over-rejection guard: a rebind with no defer and no boundary |
+
+## Additive corpus registration — 2026-10-17: malformed string escapes fail closed
+
+One case registered WITH its fix. It pins the lexer's fail-closed contract:
+a malformed `\x`/`\u`/`\U` escape in an interpreted string (LX7's Go escape
+set) must reject with `HYB-E0002`, never pass silently with a corrupted
+value. Before the fix `"\u{41}"` was ACCEPTED with 0 diagnostics and lexed
+to the value `"41}"` (the `\u{` was dropped, the rest leaked as literal
+text); `"\xG1"` became `"1"`; `"\u12G4"` became `"4"`. Root cause:
+`escape_char`'s hex-digit error paths returned `None` without recording
+the diagnostic both callers assume, so the string lexer silently kept one
+bumped char verbatim. The brace form after `\u` is LX6 rune-literal
+syntax; in a string it is a malformed escape, and the diagnostic says so.
+Surrogates (`\ud800`) and values above U+10FFFF (`\U0011FFFF`) are the
+same family and reject likewise (unit tests in `hy-syntax/src/lexer.rs`:
+six malformed cases plus the valid-escape over-rejection guard). The new
+diagnostics carry `tier0_rule` `LX6`/`LX7` so this harness can join on
+them; no registry entry changes (HYB-E0002 keeps its parse-error slot).
+
+| # | program | verdict | rule | diagnostic | rationale |
+|---|---------|---------|------|------------|-----------|
+| 61 | 61-string-escape-fail-closed | REJECT | LX7 | `HYB-E0002` | `s := "\u{41}"` — the LX6 rune form in a string is a malformed LX7 escape; it must be named, not silently dropped |
+
+With this addition the registered corpus is **61 programs:
+ACCEPT 15 · ACCEPT-MANAGED 2 · REJECT 44**. The file contains no `managed`
+block; the harness's historical as-written set {01, 03, 04} is unchanged,
+so the tripwire ratios only move with the larger total.
+
+
+## Additive corpus registration — 2026-10-18: shadowing binder must not stretch the last-use window (#547)
+
+`n := &m["a"]` opens a unique map-slot loan on `n`; a later binder that
+RE-DECLARES `n` (`for n in 0..k { total += n }`) makes the body's `n` a
+different binding. Counting those reads as uses of the loan deferred the O8
+store-back past `task worker(move m, done)` and raced with the worker on the
+moved map (`go run -race`: DATA RACE, 3/3 runs). The source is sound, so the
+registered verdict is ACCEPT: the fix belongs in the emitter's non-lexical
+flush (`remaining_stmts_use_loan`), not in the source.
+
+| # | program | verdict | rule | diagnostic | rationale |
+|---|---------|---------|------|------------|-----------|
+| 62 | 62-shadowing-binder-last-use | ACCEPT | — | — | the source is sound: the loan's last use is `n.x = 1`, before the `move`, and the shadowing `for` binder's `n` is the loop variable (#547). The checker's name-keyed window still covers the loop body (it accepts here only because no rule consumes a slot-loan window at a `move`); the emitter must flush the store-back before the spawn — that is the gate this case pins |
+| 63 | 63-shadowing-binders-at-spawn | ACCEPT | — | — | two more binder shapes behind one move boundary: an `if` INIT (`if n := 2; n > 1`) and a closure NAMED RESULT (`fn() (n int) { n = 7 }`). Both re-declare the loan's name, so the loan's last use stays `n.replicas = 5` before the `move`; counting them deferred the store-back past the spawn (same race as #547) |
+
+With these two additions the registered corpus is **63 programs:
+ACCEPT 17 · ACCEPT-MANAGED 2 · REJECT 44**.

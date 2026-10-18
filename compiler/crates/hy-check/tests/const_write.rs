@@ -723,3 +723,140 @@ fn parenthesized_const_reads_to_blank_ident_accepted_issue_460() {
     );
 }
 
+#[test]
+fn clear_on_const_map_slice_field_alias_or_closure_rejects_e3006() {
+    let r_file_map = check(
+        "const limits = map[string]int{\"free\": 10, \"pro\": 100}\n\n\
+         fn reset(done chan<- bool) {\n\
+             clear(limits)\n\
+             done <- true\n\
+         }\n\n\
+         fn main() {\n\
+             done := make(chan bool, 1)\n\
+             task reset(done)\n\
+             _ = limits[\"pro\"]\n\
+             <-done\n\
+         }\n",
+    );
+    assert!(
+        codes(&r_file_map).iter().any(|c| c == "HYB-E3006"),
+        "expected HYB-E3006 for clear(limits) on file-level const map, got {:?}",
+        codes(&r_file_map)
+    );
+    assert_eq!(r_file_map.verdict, Verdict::Reject);
+
+    let r_local_slice = check(
+        "fn main() {\n\
+             const cells = [1, 2, 3]\n\
+             clear(cells)\n\
+         }\n",
+    );
+    assert!(
+        codes(&r_local_slice).iter().any(|c| c == "HYB-E3006"),
+        "expected HYB-E3006 for clear(cells) on local const slice, got {:?}",
+        codes(&r_local_slice)
+    );
+    assert_eq!(r_local_slice.verdict, Verdict::Reject);
+
+    let r_closure = check(
+        "const cfg = map[string]int{\"a\": 1}\n\n\
+         fn main() {\n\
+             f := fn() {\n\
+                 clear(cfg)\n\
+             }\n\
+             f()\n\
+         }\n",
+    );
+    assert!(
+        codes(&r_closure).iter().any(|c| c == "HYB-E3006"),
+        "expected HYB-E3006 for clear(cfg) inside closure body, got {:?}",
+        codes(&r_closure)
+    );
+    assert_eq!(r_closure.verdict, Verdict::Reject);
+
+    let r_alias_and_field = check(
+        "struct holder {\n\
+             m map[string]int\n\
+         }\n\n\
+         const h = holder{m: map[string]int{\"a\": 1}}\n\n\
+         fn main() {\n\
+             alias := h.m\n\
+             clear(alias)\n\
+             clear(h.m)\n\
+         }\n",
+    );
+    assert_eq!(
+        codes(&r_alias_and_field)
+            .iter()
+            .filter(|c| *c == "HYB-E3006")
+            .count(),
+        2,
+        "expected 2 HYB-E3006 diagnostics for clear on const alias and field, got {:?}",
+        codes(&r_alias_and_field)
+    );
+    assert_eq!(r_alias_and_field.verdict, Verdict::Reject);
+
+    // Negative control: clear() on a mutable local map/slice remains accepted.
+    let r_ok = check(
+        "fn main() {\n\
+             m := map[string]int{\"a\": 1}\n\
+             s := [1, 2, 3]\n\
+             clear(m)\n\
+             clear(s)\n\
+         }\n",
+    );
+    assert_eq!(r_ok.verdict, Verdict::Accept, "{:?}", codes(&r_ok));
+}
+
+#[test]
+fn inplace_package_sort_on_const_slice_rejects_e3006() {
+    let r_sort_task = check(
+        "const cells = [3, 1, 2]\n\n\
+         fn bump(done chan<- bool) {\n\
+             sort.ints(cells)\n\
+             done <- true\n\
+         }\n\n\
+         fn main() {\n\
+             done := make(chan bool, 2)\n\
+             task bump(done)\n\
+             task bump(done)\n\
+             <-done\n\
+             <-done\n\
+         }\n",
+    );
+    assert!(
+        codes(&r_sort_task).iter().any(|c| c == "HYB-E3006"),
+        "expected HYB-E3006 for sort.ints(cells) on const slice, got {:?}",
+        codes(&r_sort_task)
+    );
+    assert_eq!(r_sort_task.verdict, Verdict::Reject);
+
+    let r_sort_closure = check(
+        "const names = [\"b\", \"a\"]\n\n\
+         fn main() {\n\
+             f := fn() {\n\
+                 sort.strings(names)\n\
+             }\n\
+             f()\n\
+         }\n",
+    );
+    assert!(
+        codes(&r_sort_closure).iter().any(|c| c == "HYB-E3006"),
+        "expected HYB-E3006 for sort.strings(names) in closure, got {:?}",
+        codes(&r_sort_closure)
+    );
+    assert_eq!(r_sort_closure.verdict, Verdict::Reject);
+
+    // Negative control: read-only sort.search_ints on const slice and sort.ints on mutable slice stay accepted.
+    let r_ok = check(
+        "const sorted = [1, 2, 3]\n\n\
+         fn main() {\n\
+             idx := sort.search_ints(sorted, 2)\n\
+             local := [3, 1, 2]\n\
+             sort.ints(local)\n\
+             _ = idx\n\
+         }\n",
+    );
+    assert_eq!(r_ok.verdict, Verdict::Accept, "{:?}", codes(&r_ok));
+}
+

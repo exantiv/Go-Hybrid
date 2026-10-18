@@ -57,15 +57,19 @@ impl Emitter {
             } => self.emit_if(init.as_deref(), cond, then, otherwise.as_deref()),
             Stmt::For { kind, body, .. } => self.emit_for(kind, body),
             Stmt::Return { values, .. } => self.emit_return(values),
-            Stmt::Task { callee, args, .. } => {
+            Stmt::Task { callee, args, span } => {
                 // task → go (spawn sites were checked by Tier-0; emission is
-                // a plain goroutine).
-                let c = self.emit_expr(callee, 0)?;
-                let mut parts = Vec::new();
-                for a in args {
-                    parts.push(self.emit_expr(&a.value, 0)?);
-                }
-                self.push(&format!("go {}({})", c, parts.join(", ")));
+                // a plain goroutine). Route through emit_call so argument
+                // variadic spread (`...`), pointer parameter auto-addressing,
+                // and package/shape normalization match regular call emission.
+                let call_expr = Expr::Call {
+                    callee: Box::new(callee.clone()),
+                    args: args.clone(),
+                    span: *span,
+                };
+                self.hoist_tries_expr(&call_expr)?;
+                let call = self.emit_call(callee, args)?;
+                self.push(&format!("go {}", call));
                 Ok(())
             }
             Stmt::Managed {
@@ -92,7 +96,28 @@ impl Emitter {
                 Ok(())
             }
             Stmt::Defer { call, .. } => {
-                let c = self.emit_expr(call, 0)?;
+                // P1 (§7): a deferred CALL's arguments are evaluated at defer
+                // time, so a `?` inside them hoists to a binding BEFORE this
+                // `defer`, in evaluation order — the same hoist every other
+                // statement form runs (define, assign, send, if/for/match
+                // conditions). Without it the hoister never registers the
+                // temp and `emit_expr` refuses the `?` as "outside a binding
+                // position".
+                //
+                // The operand's parens are peeled for BOTH the hoist gate and
+                // the emission, mirroring the checker's HYB-E2001 test, which
+                // unwraps parens too (a parenthesized call is still a call).
+                // Emission MUST use the peeled operand: Go rejects a
+                // parenthesized defer operand ("expression in defer must be
+                // function call"), so `defer (f.close())` has to lower to
+                // `defer f.Close()` — emitting `defer (f.Close())` would be
+                // invalid Go. A non-call operand (which the checker rejects)
+                // is left peeled-but-ungated and fails loudly below.
+                let operand = Self::peel_parens(call);
+                if matches!(operand, Expr::Call { .. }) {
+                    self.hoist_tries_expr(operand)?;
+                }
+                let c = self.emit_expr(operand, 0)?;
                 self.push(&format!("defer {}", c));
                 Ok(())
             }
@@ -1335,7 +1360,19 @@ impl Emitter {
         self.push_raw("\n");
         self.emit_block_body(&then.stmts)?;
         match otherwise {
-            None => self.push("}"),
+            None => {
+                // #546: with no `else`, the no-branch-taken path still owes
+                // the store-back of any loan handed down into this `if`.
+                if let Some(inherited) = self.branch_inherit.clone() {
+                    self.push("} else {");
+                    self.indent += 1;
+                    for (name, place) in inherited {
+                        self.push(&format!("{} = {}", place, name));
+                    }
+                    self.indent -= 1;
+                }
+                self.push("}")
+            }
             Some(Stmt::If {
                 init,
                 cond,
@@ -1408,11 +1445,16 @@ impl Emitter {
     /// the O8 slot-loan desugar sound: mutations through the loaned copy
     /// persist exactly for the loan's non-lexical live window.
     pub fn emit_block_body(&mut self, stmts: &[Stmt]) -> Result<(), EmitError> {
-        self.loan_frames.push(Vec::new());
+        // #546: a branch of a hand-off `if` starts with the inherited loans;
+        // `take` keeps nested blocks inside the branch from inheriting them
+        // again, and the restore hands the same set to the sibling branch.
+        let inherited = self.branch_inherit.take();
+        self.loan_frames.push(inherited.clone().unwrap_or_default());
         self.indent += 1;
-        self.emit_stmts_with_loans(stmts)?;
+        let r = self.emit_stmts_with_loans(stmts);
         self.indent -= 1;
-        Ok(())
+        self.branch_inherit = inherited;
+        r
     }
 
     fn block_terminates(b: &Block) -> bool {
@@ -2133,8 +2175,54 @@ impl Emitter {
     /// no longer reference the loan variable (matching `hy-check`'s non-lexical
     /// `last_use` window), and flushing any still-active loans at block exit.
     fn emit_stmts_with_loans(&mut self, stmts: &[Stmt]) -> Result<(), EmitError> {
+        // #546: a loan inherited from an enclosing hand-off `if` that this
+        // branch never uses is stored back before the branch's first
+        // statement, i.e. before any spawn/send that moves its base.
+        let mut unused = Vec::new();
+        if let Some(frame) = self.loan_frames.last_mut() {
+            let mut i = 0;
+            while i < frame.len() {
+                if !frame[i].0.is_empty() && !Self::remaining_stmts_use_loan(stmts, &frame[i].0) {
+                    unused.push(frame.remove(i));
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        for (name, place) in unused {
+            self.push(&format!("{} = {}", place, name));
+        }
         for (idx, st) in stmts.iter().enumerate() {
             let rest = &stmts[idx + 1..];
+            // #546: an `if` that is the loan's last user AND spawns/sends
+            // using the loan's base map must not get a single store-back
+            // after it: on a path that moved the map, that write races the
+            // new task. Hand the loan down into every branch instead.
+            let handoff = if matches!(st, Stmt::If { .. }) {
+                let mut h = Vec::new();
+                if let Some(frame) = self.loan_frames.last_mut() {
+                    let mut i = 0;
+                    while i < frame.len() {
+                        let (name, place) = &frame[i];
+                        if !name.is_empty()
+                            && !Self::remaining_stmts_use_loan(rest, name)
+                            && Self::stmt_has_boundary_using(st, Self::place_root(place))
+                        {
+                            h.push(frame.remove(i));
+                        } else {
+                            i += 1;
+                        }
+                    }
+                }
+                h
+            } else {
+                Vec::new()
+            };
+            let saved_inherit = if handoff.is_empty() {
+                None
+            } else {
+                Some(self.branch_inherit.replace(handoff))
+            };
             match st {
                 Stmt::Local(l) => self.emit_local_in_seq(l, rest)?,
                 Stmt::Assign {
@@ -2144,6 +2232,9 @@ impl Emitter {
                     ..
                 } => self.emit_assign_in_seq(targets, *op, values, rest)?,
                 _ => self.emit_stmt(st)?,
+            }
+            if let Some(prev) = saved_inherit {
+                self.branch_inherit = prev;
             }
             // If `rest` can still execute after `st`, flush any loan in the
             // current frame whose variable has no remaining uses in `rest`
@@ -2182,6 +2273,71 @@ impl Emitter {
     /// loan bound to `name`. A subsequent `name = &other_place` rebind (whose
     /// RHS does not itself mention `name`) starts a new loan rather than using
     /// the current loan.
+    /// Leading identifier of a rendered loan place (`m["a"]` -> `m`, `h.m[k]` -> `h`).
+    fn place_root(place: &str) -> &str {
+        let end = place
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(place.len());
+        &place[..end]
+    }
+
+    /// #546: does `st` (recursively) contain a task spawn, channel send, or
+    /// select send whose operands mention `root` (a boundary that can move
+    /// the loan's base map to another task), or a `delete(root, ...)`?
+    fn stmt_has_boundary_using(st: &Stmt, root: &str) -> bool {
+        if root.is_empty() {
+            return false;
+        }
+        let in_block = |b: &Block| {
+            b.stmts
+                .iter()
+                .any(|s| Self::stmt_has_boundary_using(s, root))
+        };
+        match st {
+            Stmt::Task { callee, args, .. } => {
+                Self::expr_mentions_ident(callee, root)
+                    || args.iter().any(|a| Self::expr_mentions_ident(&a.value, root))
+            }
+            Stmt::Send { value, .. } => Self::expr_mentions_ident(value, root),
+            // `delete(root, k)` in one branch: a single store-back after the
+            // `if` would resurrect the deleted key on that path.
+            Stmt::Expr {
+                expr: Expr::Call { callee, args, .. },
+                ..
+            } => {
+                matches!(callee.as_ref(), Expr::Ident { name, .. } if name == "delete")
+                    && args
+                        .first()
+                        .map(|a| Self::expr_mentions_ident(&a.value, root))
+                        .unwrap_or(false)
+            }
+            Stmt::If {
+                init,
+                then,
+                otherwise,
+                ..
+            } => {
+                init.as_deref()
+                    .map(|i| Self::stmt_has_boundary_using(i, root))
+                    .unwrap_or(false)
+                    || in_block(then)
+                    || otherwise
+                        .as_deref()
+                        .map(|o| Self::stmt_has_boundary_using(o, root))
+                        .unwrap_or(false)
+            }
+            Stmt::For { body, .. } => in_block(body),
+            Stmt::Block { block, .. } => in_block(block),
+            Stmt::Managed { body, .. } => in_block(body),
+            Stmt::Match { arms, .. } => arms.iter().any(|a| in_block(&a.body)),
+            Stmt::Select { arms, .. } => arms.iter().any(|a| {
+                matches!(&a.kind, SelectArmKind::Send { value, .. } if Self::expr_mentions_ident(value, root))
+                    || in_block(&a.body)
+            }),
+            _ => false,
+        }
+    }
+
     fn remaining_stmts_use_loan(stmts: &[Stmt], name: &str) -> bool {
         for st in stmts {
             match st {
@@ -2256,13 +2412,22 @@ impl Emitter {
                 otherwise,
                 ..
             } => {
-                init.as_ref()
-                    .is_some_and(|i| Self::stmt_mentions_ident(i, target))
-                    || Self::expr_mentions_ident(cond, target)
-                    || Self::block_mentions_ident(then, target)
-                    || otherwise
-                        .as_ref()
-                        .is_some_and(|o| Self::stmt_mentions_ident(o, target))
+                // #547: an `if` init that DECLARES the target shadows it for
+                // `cond`, both arms and `else` (Go's if-statement scope), so
+                // those mentions are not uses of an outer binding of the same
+                // name. The init's own value expressions still count — they
+                // run before the binding exists.
+                let init_mentions = init
+                    .as_ref()
+                    .is_some_and(|i| Self::stmt_mentions_ident(i, target));
+                let shadows = init.as_ref().is_some_and(|i| Self::local_declares(i, target));
+                init_mentions
+                    || (!shadows
+                        && (Self::expr_mentions_ident(cond, target)
+                            || Self::block_mentions_ident(then, target)
+                            || otherwise
+                                .as_ref()
+                                .is_some_and(|o| Self::stmt_mentions_ident(o, target))))
             }
             Stmt::For { kind, body, .. } => {
                 let kind_mentions = match kind {
@@ -2274,7 +2439,19 @@ impl Emitter {
                     }
                     ForKind::Iterate { expr, .. } => Self::expr_mentions_ident(expr, target),
                 };
-                kind_mentions || Self::block_mentions_ident(body, target)
+                // #547: the head expressions run BEFORE the binder exists, so
+                // they are uses of `target`; the BODY is not when the binder
+                // re-declares `target`. `for n in 0..k { total += n }` under a
+                // live slot loan `n` reads the LOOP variable, never the loan —
+                // counting those reads stretched the loan's live range past a
+                // following `move m`, which deferred the store-back `m[k] = n`
+                // past the spawn (silent data race). A genuine re-use of the
+                // outer `target` AFTER the loop is still reported by the
+                // caller's remaining-statement scan, and the caller's `false`
+                // only ever flushes the loan EARLY — it never drops a live one.
+                kind_mentions
+                    || (!Self::for_binder_shadows(kind, target)
+                        && Self::block_mentions_ident(body, target))
             }
             Stmt::Match { subject, arms, .. } => {
                 Self::expr_mentions_ident(subject, target)
@@ -2303,8 +2480,19 @@ impl Emitter {
                     }
                     SelectArmKind::Default => false,
                 };
-                head_mentions || Self::block_mentions_ident(&a.body, target)
+                // #547 (same class as the `for` binder): `n, ok := <-ch:` binds
+                // a fresh `n` for the arm body; the channel expression is
+                // evaluated before that binding exists.
+                head_mentions
+                    || (!Self::select_arm_binds(&a.kind, target)
+                        && Self::block_mentions_ident(&a.body, target))
             }),
+            // Counted conservatively: the deferred call's arguments are
+            // evaluated at registration, and hy-check treats a deferred call's
+            // captures as live, rejecting `defer` + `move` on the same arena
+            // with HYB-E3003 (defer_move_soundness). Over-counting here keeps
+            // the loan alive (fail-closed); it is not a binder, so #547 does
+            // not touch this arm.
             Stmt::Defer { call, .. } => Self::expr_mentions_ident(call, target),
             Stmt::Task { callee, args, .. } => {
                 Self::expr_mentions_ident(callee, target)
@@ -2316,6 +2504,33 @@ impl Emitter {
                 Self::block_mentions_ident(body, target)
             }
             Stmt::Break { .. } | Stmt::Continue { .. } => false,
+        }
+    }
+
+    /// Does this `Stmt` DECLARE `name` as a local? Only `Stmt::Local`
+    /// introduces bindings; the other binder shapes (`for` heads, `select`
+    /// recv names, `match` patterns) are not `Stmt`s and have their own
+    /// predicates. Called for `if` inits only (#547).
+    fn local_declares(st: &Stmt, name: &str) -> bool {
+        matches!(st, Stmt::Local(l) if l.names.iter().any(|n| n == name))
+    }
+
+    /// Does this loop head bind `name`? A re-declaration shadows any outer
+    /// binding of the same name inside the loop body only (#547).
+    fn for_binder_shadows(kind: &ForKind, name: &str) -> bool {
+        match kind {
+            ForKind::Range { var, .. } => var == name,
+            ForKind::Iterate { vars, .. } => vars.iter().any(|v| v == name),
+            ForKind::Infinite | ForKind::While { .. } => false,
+        }
+    }
+
+    /// Does this select arm's receive head bind `name`? (#547 — the arm body
+    /// then reads the fresh binding, not an outer binding of the same name.)
+    fn select_arm_binds(kind: &SelectArmKind, name: &str) -> bool {
+        match kind {
+            SelectArmKind::Recv { names, .. } => names.iter().any(|n| n == name),
+            SelectArmKind::Send { .. } | SelectArmKind::Default => false,
         }
     }
 
@@ -2396,9 +2611,21 @@ impl Emitter {
             Expr::MapLit { entries, .. } => entries.iter().any(|(k, v)| {
                 Self::expr_mentions_ident(k, target) || Self::expr_mentions_ident(v, target)
             }),
-            Expr::FnLit { params, body, .. } => {
-                !params.iter().any(|p| p.name == target)
-                    && Self::block_mentions_ident(body, target)
+            Expr::FnLit {
+                params,
+                results,
+                body,
+                ..
+            } => {
+                // #547: a closure binds its params AND its named results;
+                // either one shadows an outer binding of the same name for the
+                // body (`fn() (n int) { n = 5 }` under a live slot loan `n`
+                // assigns the RESULT, never the loan).
+                let binds = params.iter().any(|p| p.name == target)
+                    || results
+                        .iter()
+                        .any(|r| r.name.as_deref() == Some(target));
+                !binds && Self::block_mentions_ident(body, target)
             }
             Expr::Interp { parts, .. } => parts.iter().any(|p| match p {
                 InterpPart::Lit(_) => false,
